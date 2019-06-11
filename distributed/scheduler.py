@@ -6,6 +6,7 @@ from functools import partial
 import itertools
 import json
 import logging
+import math
 from numbers import Number
 import operator
 import os
@@ -52,8 +53,8 @@ from .utils import (
     key_split,
     validate_key,
     no_default,
-    DequeHandler,
     parse_timedelta,
+    parse_bytes,
     PeriodicCallback,
     shutting_down,
 )
@@ -71,9 +72,6 @@ from .variable import VariableExtension
 
 logger = logging.getLogger(__name__)
 
-
-BANDWIDTH = dask.config.get("distributed.scheduler.bandwidth")
-ALLOWED_FAILURES = dask.config.get("distributed.scheduler.allowed-failures")
 
 LOG_PDB = dask.config.get("distributed.admin.pdb-on-err")
 DEFAULT_DATA_SIZE = dask.config.get("distributed.scheduler.default-data-size")
@@ -829,7 +827,7 @@ class Scheduler(ServerNode):
         synchronize_worker_interval="60s",
         services=None,
         service_kwargs=None,
-        allowed_failures=ALLOWED_FAILURES,
+        allowed_failures=None,
         extensions=None,
         validate=False,
         scheduler_file=None,
@@ -843,9 +841,11 @@ class Scheduler(ServerNode):
         dashboard_address=None,
         **kwargs
     ):
-        self._setup_logging()
+        self._setup_logging(logger)
 
         # Attributes
+        if allowed_failures is None:
+            allowed_failures = dask.config.get("distributed.scheduler.allowed-failures")
         self.allowed_failures = allowed_failures
         self.validate = validate
         self.status = None
@@ -856,6 +856,7 @@ class Scheduler(ServerNode):
         )
         self.digests = None
         self.service_specs = services or {}
+        self.service_kwargs = service_kwargs or {}
         self.services = {}
         self.scheduler_file = scheduler_file
         worker_ttl = worker_ttl or dask.config.get("distributed.scheduler.worker-ttl")
@@ -868,6 +869,7 @@ class Scheduler(ServerNode):
         else:
             self.idle_timeout = None
         self.time_started = time()
+        self.bandwidth = parse_bytes(dask.config.get("distributed.scheduler.bandwidth"))
 
         self.security = security or Security()
         assert isinstance(self.security, Security)
@@ -876,13 +878,13 @@ class Scheduler(ServerNode):
 
         if dashboard_address is not None:
             try:
-                from distributed.bokeh.scheduler import BokehScheduler
+                from distributed.dashboard import BokehScheduler
             except ImportError:
                 logger.debug("To start diagnostics web server please install Bokeh")
             else:
-                self.service_specs[("bokeh", dashboard_address)] = (
+                self.service_specs[("dashboard", dashboard_address)] = (
                     BokehScheduler,
-                    (service_kwargs or {}).get("bokeh", {}),
+                    (service_kwargs or {}).get("dashboard", {}),
                 )
 
         # Communication state
@@ -1001,7 +1003,7 @@ class Scheduler(ServerNode):
         self.log = deque(
             maxlen=dask.config.get("distributed.scheduler.transition-log-length")
         )
-        self.worker_setups = []
+        self.worker_plugins = []
 
         worker_handlers = {
             "task-finished": self.handle_task_finished,
@@ -1060,7 +1062,8 @@ class Scheduler(ServerNode):
             "heartbeat_worker": self.heartbeat_worker,
             "get_task_status": self.get_task_status,
             "get_task_stream": self.get_task_stream,
-            "register_worker_callbacks": self.register_worker_callbacks,
+            "register_worker_plugin": self.register_worker_plugin,
+            "adaptive_target": self.adaptive_target,
         }
 
         self._transitions = {
@@ -1263,6 +1266,7 @@ class Scheduler(ServerNode):
         setproctitle("dask-scheduler [closing]")
 
         if close_workers:
+            self.broadcast(msg={"op": "close_gracefully"}, nanny=True)
             for worker in self.workers:
                 self.worker_send(worker, {"op": "close"})
             for i in range(20):  # wait a second for send signals to clear
@@ -1324,16 +1328,6 @@ class Scheduler(ServerNode):
             self.worker_send(worker, {"op": "close", "report": False})
             self.remove_worker(address=worker, safe=safe)
 
-    def _setup_logging(self):
-        self._deque_handler = DequeHandler(
-            n=dask.config.get("distributed.admin.log-length")
-        )
-        self._deque_handler.setFormatter(
-            logging.Formatter(dask.config.get("distributed.admin.log-format"))
-        )
-        logger.addHandler(self._deque_handler)
-        finalize(self, logger.removeHandler, self._deque_handler)
-
     ###########
     # Stimuli #
     ###########
@@ -1352,6 +1346,9 @@ class Scheduler(ServerNode):
         address = self.coerce_address(address, resolve_address)
         address = normalize_address(address)
         host = get_address_host(address)
+        if address not in self.workers:
+            logger.info("Received heartbeat from removed worker: %s", address)
+            return
 
         local_now = time()
         now = now or time()
@@ -1359,6 +1356,11 @@ class Scheduler(ServerNode):
         host_info = host_info or {}
 
         self.host_info[host]["last-seen"] = local_now
+        frac = 1 / 20 / len(self.workers)
+        try:
+            self.bandwidth = self.bandwidth * (1 - frac) + metrics["bandwidth"] * frac
+        except KeyError:
+            pass
 
         ws = self.workers.get(address)
         if not ws:
@@ -1503,7 +1505,7 @@ class Scheduler(ServerNode):
                     "status": "OK",
                     "time": time(),
                     "heartbeat-interval": heartbeat_interval(len(self.workers)),
-                    "worker-setups": self.worker_setups,
+                    "worker-plugins": self.worker_plugins,
                 }
             )
             yield self.handle_worker(comm=comm, worker=address)
@@ -1983,7 +1985,10 @@ class Scheduler(ServerNode):
         """ Cancel a particular key and all dependents """
         # TODO: this should be converted to use the transition mechanism
         ts = self.tasks.get(key)
-        cs = self.clients[client]
+        try:
+            cs = self.clients[client]
+        except KeyError:
+            return
         if ts is None or not ts.who_wants:  # no key yet, lets try again in a moment
             if retries:
                 self.loop.add_future(
@@ -3078,7 +3083,7 @@ class Scheduler(ServerNode):
                     except KeyError:  # keys left during replicate
                         pass
 
-            workers = {self.workers[w] for w in workers}
+            workers = {self.workers[w] for w in workers if w in self.workers}
             if len(workers) > 0:
                 # Keys orphaned by retiring those workers
                 keys = set.union(*[w.has_what for w in workers])
@@ -3336,7 +3341,7 @@ class Scheduler(ServerNode):
         Get the estimated communication cost (in s.) to compute the task
         on the given worker.
         """
-        return sum(dts.nbytes for dts in ts.dependencies - ws.has_what) / BANDWIDTH
+        return sum(dts.nbytes for dts in ts.dependencies - ws.has_what) / self.bandwidth
 
     def get_task_duration(self, ts, default=0.5):
         """
@@ -3400,14 +3405,13 @@ class Scheduler(ServerNode):
         return ts.collect(start=start, stop=stop, count=count)
 
     @gen.coroutine
-    def register_worker_callbacks(self, comm, setup=None):
+    def register_worker_plugin(self, comm, plugin, name=None):
         """ Registers a setup function, and call it on every worker """
-        if setup is None:
-            raise gen.Return({})
+        self.worker_plugins.append(plugin)
 
-        self.worker_setups.append(setup)
-
-        responses = yield self.broadcast(msg=dict(op="run", function=setup))
+        responses = yield self.broadcast(
+            msg=dict(op="plugin-add", plugin=plugin, name=name)
+        )
         raise gen.Return(responses)
 
     #####################
@@ -4351,6 +4355,19 @@ class Scheduler(ServerNode):
     ##############################
 
     def check_idle_saturated(self, ws, occ=None):
+        """ Update the status of the idle and saturated state
+
+        The scheduler keeps track of workers that are ..
+
+        -  Saturated: have enough work to stay busy
+        -  Idle: do not have enough work to stay busy
+
+        They are considered saturated if they both have enough tasks to occupy
+        all of their cores, and if the expected runtime of those tasks is large
+        enough.
+
+        This is useful for load balancing and adaptivity.
+        """
         if self.total_ncores == 0 or ws.status == "closed":
             return
         if occ is None:
@@ -4522,7 +4539,7 @@ class Scheduler(ServerNode):
             [dts.get_nbytes() for dts in ts.dependencies if ws not in dts.who_has]
         )
         stack_time = ws.occupancy / ws.ncores
-        start_time = comm_bytes / BANDWIDTH + stack_time
+        start_time = comm_bytes / self.bandwidth + stack_time
 
         if ts.actor:
             return (len(ws.actors), start_time, ws.nbytes)
@@ -4599,18 +4616,11 @@ class Scheduler(ServerNode):
 
         raise gen.Return({"counts": counts, "keys": keys})
 
-    def get_logs(self, comm=None, n=None):
-        deque_handler = self._deque_handler
-        if n is None:
-            L = list(deque_handler.deque)
-        else:
-            L = deque_handler.deque
-            L = [L[-i] for i in range(min(n, len(L)))]
-        return [(msg.levelname, deque_handler.format(msg)) for msg in L]
-
     @gen.coroutine
-    def get_worker_logs(self, comm=None, n=None, workers=None):
-        results = yield self.broadcast(msg={"op": "get_logs", "n": n}, workers=workers)
+    def get_worker_logs(self, comm=None, n=None, workers=None, nanny=False):
+        results = yield self.broadcast(
+            msg={"op": "get_logs", "n": n}, workers=workers, nanny=nanny
+        )
         raise gen.Return(results)
 
     ###########
@@ -4713,6 +4723,59 @@ class Scheduler(ServerNode):
 
         if close:
             self.loop.add_callback(self.close)
+
+    def adaptive_target(self, target_duration="5s"):
+        """ Desired number of workers based on the current workload
+
+        This looks at the current running tasks and memory use, and returns a
+        number of desired workers.  This is often used by adaptive scheduling.
+
+        Parameters
+        ----------
+        target_duration: str
+            A desired duration of time for computations to take.  This affects
+            how rapidly the scheduler will ask to scale.
+
+        See Also
+        --------
+        distributed.deploy.Adaptive
+        """
+        target_duration = parse_timedelta(target_duration)
+
+        # CPU
+        cpu = math.ceil(
+            self.total_occupancy / target_duration
+        )  # TODO: threads per worker
+
+        # Avoid a few long tasks from asking for many cores
+        tasks_processing = 0
+        for ws in self.workers.values():
+            tasks_processing += len(ws.processing)
+
+            if tasks_processing > cpu:
+                break
+        else:
+            cpu = min(tasks_processing, cpu)
+
+        if self.unrunnable and not self.workers:
+            cpu = max(1, cpu)
+
+        # Memory
+        limit_bytes = {addr: ws.memory_limit for addr, ws in self.workers.items()}
+        worker_bytes = [ws.nbytes for ws in self.workers.values()]
+        limit = sum(limit_bytes.values())
+        total = sum(worker_bytes)
+        if total > 0.6 * limit:
+            memory = 2 * len(self.workers)
+        else:
+            memory = 0
+
+        target = max(memory, cpu)
+        if target >= len(self.workers):
+            return target
+        else:  # Scale down?
+            to_close = self.workers_to_close()
+            return len(self.workers) - len(to_close)
 
 
 def decide_worker(ts, all_workers, valid_workers, objective):

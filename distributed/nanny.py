@@ -18,7 +18,7 @@ from tornado.locks import Event
 
 from .comm import get_address_host, get_local_address_for, unparse_host_port
 from .comm.addressing import address_from_user_args
-from .core import rpc, RPCClosed, CommClosedError, coerce_to_address
+from .core import RPCClosed, CommClosedError, coerce_to_address
 from .metrics import time
 from .node import ServerNode
 from .process import AsyncProcess
@@ -30,6 +30,7 @@ from .utils import (
     silence_logging,
     json_load_robust,
     PeriodicCallback,
+    parse_timedelta,
 )
 from .worker import _ncores, run, parse_memory_limit, Worker
 
@@ -78,6 +79,12 @@ class Nanny(ServerNode):
         protocol=None,
         **worker_kwargs
     ):
+        self._setup_logging(logger)
+        self.loop = loop or IOLoop.current()
+        self.security = security or Security()
+        assert isinstance(self.security, Security)
+        self.connection_args = self.security.get_connection_args("worker")
+        self.listen_args = self.security.get_listen_args("worker")
 
         if scheduler_file:
             cfg = json_load_robust(scheduler_file)
@@ -88,12 +95,13 @@ class Nanny(ServerNode):
             self.scheduler_addr = coerce_to_address(scheduler_ip)
         else:
             self.scheduler_addr = coerce_to_address((scheduler_ip, scheduler_port))
+
         self._given_worker_port = worker_port
         self.ncores = ncores or _ncores
         self.reconnect = reconnect
         self.validate = validate
         self.resources = resources
-        self.death_timeout = death_timeout
+        self.death_timeout = parse_timedelta(death_timeout)
         self.preload = preload
         self.preload_argv = preload_argv
         self.Worker = Worker if worker_class is None else worker_class
@@ -105,15 +113,8 @@ class Nanny(ServerNode):
             "distributed.worker.memory.terminate"
         )
 
-        self.security = security or Security()
-        assert isinstance(self.security, Security)
-        self.connection_args = self.security.get_connection_args("worker")
-        self.listen_args = self.security.get_listen_args("worker")
-
         self.local_dir = local_dir
 
-        self.loop = loop or IOLoop.current()
-        self.scheduler = rpc(self.scheduler_addr, connection_args=self.connection_args)
         self.services = services
         self.name = name
         self.quiet = quiet
@@ -130,13 +131,17 @@ class Nanny(ServerNode):
             "kill": self.kill,
             "restart": self.restart,
             # cannot call it 'close' on the rpc side for naming conflict
+            "get_logs": self.get_logs,
             "terminate": self.close,
+            "close_gracefully": self.close_gracefully,
             "run": self.run,
         }
 
         super(Nanny, self).__init__(
-            handlers, io_loop=self.loop, connection_args=self.connection_args
+            handlers=handlers, io_loop=self.loop, connection_args=self.connection_args
         )
+
+        self.scheduler = self.rpc(self.scheduler_addr)
 
         if self.memory_limit:
             pc = PeriodicCallback(self.memory_monitor, 100, io_loop=self.loop)
@@ -240,7 +245,6 @@ class Nanny(ServerNode):
 
         deadline = self.loop.time() + timeout
         yield self.process.kill(timeout=0.8 * (deadline - self.loop.time()))
-        yield self._unregister(deadline - self.loop.time())
 
     @gen.coroutine
     def instantiate(self, comm=None):
@@ -326,9 +330,9 @@ class Nanny(ServerNode):
             return
         try:
             proc = psutil.Process(process.pid)
-        except psutil.NoSuchProcess:
+            memory = proc.memory_info().rss
+        except (ProcessLookupError, psutil.NoSuchProcess, psutil.AccessDenied):
             return
-        memory = proc.memory_info().rss
         frac = memory / self.memory_limit
         if self.memory_terminate_fraction and frac > self.memory_terminate_fraction:
             logger.warning(
@@ -354,7 +358,7 @@ class Nanny(ServerNode):
                     return
 
             try:
-                if self.status not in ("closing", "closed"):
+                if self.status not in ("closing", "closed", "closing-gracefully"):
                     if self.auto_restart:
                         logger.warning("Restarting worker")
                         yield self.instantiate()
@@ -371,13 +375,25 @@ class Nanny(ServerNode):
         warnings.warn("Worker._close has moved to Worker.close", stacklevel=2)
         return self.close(*args, **kwargs)
 
+    def close_gracefully(self, comm=None):
+        """
+        A signal that we shouldn't try to restart workers if they go away
+
+        This is used as part of the cluster shutdown process.
+        """
+        self.status = "closing-gracefully"
+
     @gen.coroutine
     def close(self, comm=None, timeout=5, report=None):
         """
         Close the worker process, stop all comms.
         """
-        if self.status in ("closing", "closed"):
+        while self.status == "closing":
+            yield gen.sleep(0.01)
+
+        if self.status == "closed":
             raise gen.Return("OK")
+
         self.status = "closing"
         logger.info("Closing Nanny at %r", self.address)
         self.stop()
@@ -388,9 +404,10 @@ class Nanny(ServerNode):
             pass
         self.process = None
         self.rpc.close()
-        self.scheduler.close_rpc()
         self.status = "closed"
-        raise gen.Return("OK")
+        if comm:
+            yield comm.write("OK")
+        yield ServerNode.close(self)
 
 
 class WorkerProcess(object):
@@ -449,7 +466,7 @@ class WorkerProcess(object):
                 env=self.env,
             ),
         )
-        self.process.daemon = True
+        self.process.daemon = dask.config.get("distributed.worker.daemon", default=True)
         self.process.set_exit_callback(self._on_exit)
         self.running = Event()
         self.stopped = Event()

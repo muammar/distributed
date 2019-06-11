@@ -44,7 +44,7 @@ conda install -q \
     paramiko \
     prometheus_client \
     psutil \
-    pytest \
+    pytest>=4 \
     pytest-timeout \
     python=$PYTHON \
     requests \
@@ -59,7 +59,7 @@ conda install -q \
 conda install -c defaults -c conda-forge libunwind
 conda install --no-deps -c defaults -c numba -c conda-forge stacktrace
 
-pip install -q pytest-repeat pytest-faulthandler
+pip install -q "pytest>=4" pytest-repeat pytest-faulthandler pytest-asyncio
 
 pip install -q git+https://github.com/dask/dask.git --upgrade --no-deps
 pip install -q git+https://github.com/joblib/joblib.git --upgrade --no-deps

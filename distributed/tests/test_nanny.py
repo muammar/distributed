@@ -5,6 +5,7 @@ import logging
 import os
 import random
 import sys
+import multiprocessing as mp
 
 import numpy as np
 
@@ -108,10 +109,6 @@ def test_nanny_process_failure(c, s):
     assert first_dir != n.worker_dir
     ww.close_rpc()
     s.stop()
-
-
-def test_nanny_no_port():
-    _ = str(Nanny("127.0.0.1", 8786))
 
 
 @gen_cluster(ncores=[])
@@ -319,12 +316,13 @@ def test_scheduler_address_config(c, s):
 
 
 @pytest.mark.slow
-@gen_test()
+@gen_test(timeout=20)
 def test_wait_for_scheduler():
     with captured_logger("distributed") as log:
         w = Nanny("127.0.0.1:44737")
-        w._start()
+        w.start()
         yield gen.sleep(6)
+        yield w.close()
 
     log = log.getvalue()
     assert "error" not in log.lower(), log
@@ -347,3 +345,37 @@ def test_data_types(c, s):
     r = yield c.run(lambda dask_worker: type(dask_worker.data))
     assert r[w.worker_address] == dict
     yield w.close()
+
+
+def _noop(x):
+    """Define here because closures aren't pickleable."""
+    pass
+
+
+@gen_cluster(
+    ncores=[("127.0.0.1", 1)],
+    client=True,
+    Worker=Nanny,
+    config={"distributed.worker.daemon": False},
+)
+def test_mp_process_worker_no_daemon(c, s, a):
+    def multiprocessing_worker():
+        p = mp.Process(target=_noop, args=(None,))
+        p.start()
+        p.join()
+
+    yield c.submit(multiprocessing_worker)
+
+
+@gen_cluster(
+    ncores=[("127.0.0.1", 1)],
+    client=True,
+    Worker=Nanny,
+    config={"distributed.worker.daemon": False},
+)
+def test_mp_pool_worker_no_daemon(c, s, a):
+    def pool_worker(world_size):
+        with mp.Pool(processes=world_size) as p:
+            p.map(_noop, range(world_size))
+
+    yield c.submit(pool_worker, 4)
