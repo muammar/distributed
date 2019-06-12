@@ -484,19 +484,21 @@ class Server(object):
                 pdb.set_trace()
             raise
         finally:
-            comm.close()  # TODO: why do we need this now?
+            yield comm.close()
             assert comm.closed()
 
     @gen.coroutine
     def close(self):
-        self.listener.stop()
+        for pc in self.periodic_callbacks.values():
+            pc.stop()
+        if self.listener:
+            self.listener.stop()
         for i in range(20):  # let comms close naturally for a second
             if not self._comms:
                 break
             else:
                 yield gen.sleep(0.05)
-        for comm in self._comms:
-            comm.close()
+        yield [comm.close() for comm in self._comms]  # then forcefully close
         for cb in self._ongoing_coroutines:
             cb.cancel()
         for i in range(10):
@@ -899,7 +901,7 @@ class ConnectionPool(object):
         )
         for addr, comms in self.available.items():
             for comm in comms:
-                comm.close()
+                IOLoop.current().add_callback(comm.close)
             comms.clear()
         if self.open < self.limit:
             self.event.set()
@@ -912,11 +914,11 @@ class ConnectionPool(object):
         if addr in self.available:
             comms = self.available.pop(addr)
             for comm in comms:
-                comm.close()
+                IOLoop.current().add_callback(comm.close)
         if addr in self.occupied:
             comms = self.occupied.pop(addr)
             for comm in comms:
-                comm.close()
+                IOLoop.current().add_callback(comm.close)
         if self.open < self.limit:
             self.event.set()
 

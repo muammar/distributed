@@ -5,6 +5,7 @@ import dask
 import logging
 import gc
 import os
+import re
 import shutil
 import sys
 import tempfile
@@ -16,12 +17,7 @@ from tornado.ioloop import IOLoop
 
 from distributed import Scheduler
 from distributed.security import Security
-from distributed.utils import get_ip_interface
-from distributed.cli.utils import (
-    check_python_3,
-    install_signal_handlers,
-    uri_from_host_port,
-)
+from distributed.cli.utils import check_python_3, install_signal_handlers
 from distributed.preloading import preload_modules, validate_preload_argv
 from distributed.proctitle import (
     enable_proctitle_on_children,
@@ -42,6 +38,9 @@ pem_file_option_type = click.Path(exists=True, resolve_path=True)
     type=str,
     default=None,
     help="Preferred network interface like 'eth0' or 'ib0'",
+)
+@click.option(
+    "--protocol", type=str, default=None, help="Protocol like tcp, tls, or ucx"
 )
 @click.option(
     "--tls-ca-file",
@@ -72,27 +71,23 @@ pem_file_option_type = click.Path(exists=True, resolve_path=True)
     help="Address on which to listen for diagnostics dashboard",
 )
 @click.option(
-    "--bokeh/--no-bokeh",
-    "_bokeh",
+    "--dashboard/--no-dashboard",
+    "dashboard",
     default=True,
     show_default=True,
     required=False,
-    help="Launch Bokeh Web UI",
+    help="Launch the Dashboard",
 )
 @click.option("--show/--no-show", default=False, help="Show web UI")
 @click.option(
-    "--bokeh-whitelist",
-    default=None,
-    multiple=True,
-    help="IP addresses to whitelist for bokeh.",
+    "--dashboard-prefix", type=str, default=None, help="Prefix for the dashboard app"
 )
-@click.option("--bokeh-prefix", type=str, default=None, help="Prefix for the bokeh app")
 @click.option(
     "--use-xheaders",
     type=bool,
     default=False,
     show_default=True,
-    help="User xheaders in bokeh app for ssl termination in header",
+    help="User xheaders in dashboard app for ssl termination in header",
 )
 @click.option("--pid-file", type=str, default="", help="File to write the process PID")
 @click.option(
@@ -123,13 +118,13 @@ def main(
     port,
     bokeh_port,
     show,
-    _bokeh,
-    bokeh_whitelist,
-    bokeh_prefix,
+    dashboard,
+    dashboard_prefix,
     use_xheaders,
     pid_file,
     scheduler_file,
     interface,
+    protocol,
     local_directory,
     preload,
     preload_argv,
@@ -150,6 +145,9 @@ def main(
             "Consider adding ``--dashboard-address :%d`` " % bokeh_port
         )
         dashboard_address = bokeh_port
+
+    if port is None and (not host or not re.search(r":\d", host)):
+        port = 8786
 
     sec = Security(
         tls_ca_file=tls_ca_file, tls_scheduler_cert=tls_cert, tls_scheduler_key=tls_key
@@ -186,36 +184,21 @@ def main(
         limit = max(soft, hard // 2)
         resource.setrlimit(resource.RLIMIT_NOFILE, (limit, hard))
 
-    if interface:
-        if host:
-            raise ValueError("Can not specify both interface and host")
-        else:
-            host = get_ip_interface(interface)
-
-    addr = uri_from_host_port(host, port, 8786)
-
     loop = IOLoop.current()
     logger.info("-" * 47)
 
-    services = {}
-    if _bokeh:
-        try:
-            from distributed.bokeh.scheduler import BokehScheduler
-
-            services[("bokeh", dashboard_address)] = (
-                BokehScheduler,
-                {"prefix": bokeh_prefix},
-            )
-        except ImportError as error:
-            if str(error).startswith("No module named"):
-                logger.info("Web dashboard not loaded.  Unable to import bokeh")
-            else:
-                logger.info("Unable to import bokeh: %s" % str(error))
-
     scheduler = Scheduler(
-        loop=loop, services=services, scheduler_file=scheduler_file, security=sec
+        loop=loop,
+        scheduler_file=scheduler_file,
+        security=sec,
+        host=host,
+        port=port,
+        interface=interface,
+        protocol=protocol,
+        dashboard_address=dashboard_address if dashboard else None,
+        service_kwargs={"dashboard": {"prefix": dashboard_prefix}},
     )
-    scheduler.start(addr)
+    scheduler.start()
     if not preload:
         preload = dask.config.get("distributed.scheduler.preload")
     if not preload_argv:
@@ -237,7 +220,7 @@ def main(
         if local_directory_created:
             shutil.rmtree(local_directory)
 
-        logger.info("End scheduler at %r", addr)
+        logger.info("End scheduler at %r", scheduler.address)
 
 
 def go():

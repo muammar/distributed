@@ -8,16 +8,12 @@ from sys import exit
 import warnings
 
 import click
+import dask
 from distributed import Nanny, Worker
-from distributed.config import config
-from distributed.utils import get_ip_interface, parse_timedelta
+from distributed.utils import parse_timedelta
 from distributed.worker import _ncores
 from distributed.security import Security
-from distributed.cli.utils import (
-    check_python_3,
-    uri_from_host_port,
-    install_signal_handlers,
-)
+from distributed.cli.utils import check_python_3, install_signal_handlers
 from distributed.comm import get_address_host_port
 from distributed.preloading import validate_preload_argv
 from distributed.proctitle import (
@@ -74,12 +70,12 @@ pem_file_option_type = click.Path(exists=True, resolve_path=True)
     help="Address on which to listen for diagnostics dashboard",
 )
 @click.option(
-    "--bokeh/--no-bokeh",
-    "bokeh",
+    "--dashboard/--no-dashboard",
+    "dashboard",
     default=True,
     show_default=True,
     required=False,
-    help="Launch Bokeh Web UI",
+    help="Launch the Dashboard",
 )
 @click.option(
     "--listen-address",
@@ -108,6 +104,9 @@ pem_file_option_type = click.Path(exists=True, resolve_path=True)
 @click.option(
     "--interface", type=str, default=None, help="Network interface like 'eth0' or 'ib0'"
 )
+@click.option(
+    "--protocol", type=str, default=None, help="Protocol like tcp, tls, or ucx"
+)
 @click.option("--nthreads", type=int, default=0, help="Number of threads per process.")
 @click.option(
     "--nprocs",
@@ -118,7 +117,7 @@ pem_file_option_type = click.Path(exists=True, resolve_path=True)
 @click.option(
     "--name",
     type=str,
-    default="",
+    default=None,
     help="A unique name for this worker like 'worker-1'. "
     "If used with --nprocs then the process number "
     "will be appended like name-0, name-1, name-2, ...",
@@ -167,7 +166,9 @@ pem_file_option_type = click.Path(exists=True, resolve_path=True)
     default=None,
     help="Seconds to wait for a scheduler before closing",
 )
-@click.option("--bokeh-prefix", type=str, default=None, help="Prefix for the bokeh app")
+@click.option(
+    "--dashboard-prefix", type=str, default="", help="Prefix for the dashboard"
+)
 @click.option(
     "--preload",
     type=str,
@@ -194,15 +195,16 @@ def main(
     pid_file,
     reconnect,
     resources,
-    bokeh,
+    dashboard,
     bokeh_port,
     local_directory,
     scheduler_file,
     interface,
+    protocol,
     death_timeout,
     preload,
     preload_argv,
-    bokeh_prefix,
+    dashboard_prefix,
     tls_ca_file,
     tls_cert,
     tls_key,
@@ -292,18 +294,6 @@ def main(
 
     services = {}
 
-    if bokeh:
-        try:
-            from distributed.bokeh.worker import BokehWorker
-        except ImportError:
-            pass
-        else:
-            if bokeh_prefix:
-                result = (BokehWorker, {"prefix": bokeh_prefix})
-            else:
-                result = BokehWorker
-            services[("bokeh", dashboard_address)] = result
-
     if resources:
         resources = resources.replace(",", " ").split()
         resources = dict(pair.split("=") for pair in resources)
@@ -322,23 +312,15 @@ def main(
             kwargs["service_ports"] = {"nanny": nanny_port}
         t = Worker
 
-    if not scheduler and not scheduler_file and "scheduler-address" not in config:
+    if (
+        not scheduler
+        and not scheduler_file
+        and dask.config.get("scheduler-address", None) is None
+    ):
         raise ValueError(
             "Need to provide scheduler address like\n"
             "dask-worker SCHEDULER_ADDRESS:8786"
         )
-
-    if interface:
-        if host:
-            raise ValueError("Can not specify both interface and host")
-        else:
-            host = get_ip_interface(interface)
-
-    if host or port:
-        addr = uri_from_host_port(host, port, 0)
-    else:
-        # Choose appropriate address for scheduler
-        addr = None
 
     if death_timeout is not None:
         death_timeout = parse_timedelta(death_timeout, "s")
@@ -359,6 +341,12 @@ def main(
             preload_argv=preload_argv,
             security=sec,
             contact_address=contact_address,
+            interface=interface,
+            protocol=protocol,
+            host=host,
+            port=port,
+            dashboard_address=dashboard_address if dashboard else None,
+            service_kwargs={"bokhe": {"prefix": dashboard_prefix}},
             name=name if nprocs == 1 or not name else name + "-" + str(i),
             **kwargs
         )
@@ -377,7 +365,7 @@ def main(
 
     @gen.coroutine
     def run():
-        yield [n._start(addr) for n in nannies]
+        yield nannies
         while all(n.status != "closed" for n in nannies):
             yield gen.sleep(0.2)
 

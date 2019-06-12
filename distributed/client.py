@@ -2,8 +2,8 @@ from __future__ import print_function, division, absolute_import
 
 import atexit
 from collections import defaultdict
-from concurrent.futures import ThreadPoolExecutor
-from concurrent.futures._base import DoneAndNotDoneFutures, CancelledError
+from concurrent.futures import ThreadPoolExecutor, CancelledError
+from concurrent.futures._base import DoneAndNotDoneFutures
 from contextlib import contextmanager
 import copy
 from datetime import timedelta
@@ -44,6 +44,8 @@ from tornado.locks import Event, Condition, Semaphore
 from tornado.ioloop import IOLoop
 from tornado.queues import Queue
 
+from asyncio import iscoroutine
+
 from .batched import BatchedSend
 from .utils_comm import (
     WrappedKey,
@@ -55,7 +57,6 @@ from .utils_comm import (
 from .cfexecutor import ClientExecutor
 from .compatibility import (
     Queue as pyQueue,
-    Empty,
     isqueue,
     html_escape,
     StopAsyncIteration,
@@ -77,7 +78,6 @@ from .utils import (
     sync,
     funcname,
     ignoring,
-    queue_to_iterator,
     tokey,
     log_errors,
     str_graph,
@@ -91,6 +91,7 @@ from .utils import (
     parse_timedelta,
     shutting_down,
     Any,
+    has_keyword,
 )
 from .versions import get_versions
 
@@ -506,12 +507,19 @@ class AllExit(Exception):
 
 
 class Client(Node):
-    """ Connect to and drive computation on a distributed Dask cluster
+    """ Connect to and submit computation to a Dask cluster
 
-    The Client connects users to a dask.distributed compute cluster.  It
-    provides an asynchronous user interface around functions and futures.  This
-    class resembles executors in ``concurrent.futures`` but also allows
-    ``Future`` objects within ``submit/map`` calls.
+    The Client connects users to a Dask cluster.  It provides an asynchronous
+    user interface around functions and futures.  This class resembles
+    executors in ``concurrent.futures`` but also allows ``Future`` objects
+    within ``submit/map`` calls.  When a Client is instantiated it takes over
+    all ``dask.compute`` and ``dask.persist`` calls by default.
+
+    It is also common to create a Client without specifying the scheduler
+    address , like ``Client()``.  In this case the Client creates a
+    ``LocalCluster`` in the background and connects to that.  Any extra
+    keywords are passed from Client to LocalCluster in this case.  See the
+    LocalCluster documentation for more information.
 
     Parameters
     ----------
@@ -576,6 +584,8 @@ class Client(Node):
     distributed.scheduler.Scheduler: Internal scheduler
     distributed.deploy.local.LocalCluster:
     """
+
+    _instances = weakref.WeakSet()
 
     def __init__(
         self,
@@ -710,6 +720,7 @@ class Client(Node):
             ext(self)
 
         self.start(timeout=timeout)
+        Client._instances.add(self)
 
         from distributed.recreate_exceptions import ReplayExceptionClient
 
@@ -801,9 +812,9 @@ class Client(Node):
             text = (
                 "<h3>Client</h3>\n" "<ul>\n" "  <li><b>Scheduler: not connected</b>\n"
             )
-        if info and "bokeh" in info["services"]:
+        if info and "dashboard" in info["services"]:
             protocol, rest = scheduler.address.split("://")
-            port = info["services"]["bokeh"]
+            port = info["services"]["dashboard"]
             if protocol == "inproc":
                 host = "localhost"
             else:
@@ -1050,6 +1061,17 @@ class Client(Node):
         except EnvironmentError:
             logger.debug("Not able to query scheduler for identity")
 
+    @gen.coroutine
+    def _wait_for_workers(self, n_workers=0):
+        info = yield self.scheduler.identity()
+        while n_workers and len(info["workers"]) < n_workers:
+            yield gen.sleep(0.1)
+            info = yield self.scheduler.identity()
+
+    def wait_for_workers(self, n_workers=0):
+        """Blocking call to wait for n workers before continuing"""
+        return self.sync(self._wait_for_workers, n_workers)
+
     def _heartbeat(self):
         if self.scheduler_comm:
             self.scheduler_comm.send({"op": "heartbeat-client"})
@@ -1192,10 +1214,11 @@ class Client(Node):
         """ Send close signal and wait until scheduler completes """
         self.status = "closing"
 
+        for pc in self._periodic_callbacks.values():
+            pc.stop()
+
         with log_errors():
             _del_global_client(self)
-            for pc in self._periodic_callbacks.values():
-                pc.stop()
             self._scheduler_identity = {}
             with ignoring(AttributeError):
                 # clear the dask.config set keys
@@ -1277,6 +1300,9 @@ class Client(Node):
             return
         self.status = "closing"
 
+        for pc in self._periodic_callbacks.values():
+            pc.stop()
+
         if self.asynchronous:
             future = self._close()
             if timeout:
@@ -1285,7 +1311,13 @@ class Client(Node):
 
         if self._start_arg is None:
             with ignoring(AttributeError):
-                self.cluster.close()
+                f = self.cluster.close()
+                if iscoroutine(f):
+
+                    async def _():
+                        await f
+
+                    self.sync(_)
 
         sync(self.loop, self._close, fast=True)
 
@@ -1421,24 +1453,6 @@ class Client(Node):
 
         return futures[skey]
 
-    def _threaded_map(self, q_out, func, qs_in, **kwargs):
-        """ Internal function for mapping Queue """
-        if isqueue(qs_in[0]):
-            get = pyQueue.get
-        elif isinstance(qs_in[0], Iterator):
-            get = next
-        else:
-            raise NotImplementedError()
-
-        while True:
-            try:
-                args = [get(q) for q in qs_in]
-            except StopIteration as e:
-                q_out.put(e)
-                break
-            f = self.submit(func, *args, **kwargs)
-            q_out.put(f)
-
     def map(self, func, *iterables, **kwargs):
         """ Map a function on a sequence of arguments
 
@@ -1447,7 +1461,8 @@ class Client(Node):
         Parameters
         ----------
         func: callable
-        iterables: Iterables, Iterators, or Queues
+        iterables: Iterables
+            List-like objects to map over.  They should have the same length.
         key: str, list
             Prefix for task names if string.  Explicit names if list.
         pure: bool (defaults to True)
@@ -1486,20 +1501,10 @@ class Client(Node):
         if all(map(isqueue, iterables)) or all(
             isinstance(i, Iterator) for i in iterables
         ):
-            maxsize = kwargs.pop("maxsize", 0)
-            q_out = pyQueue(maxsize=maxsize)
-            t = threading.Thread(
-                target=self._threaded_map,
-                name="Threaded map()",
-                args=(q_out, func, iterables),
-                kwargs=kwargs,
+            raise TypeError(
+                "Dask no longer supports mapping over Iterators or Queues."
+                "Consider using a normal for loop and Client.submit"
             )
-            t.daemon = True
-            t.start()
-            if isqueue(iterables[0]):
-                return q_out
-            else:
-                return queue_to_iterator(q_out)
 
         key = kwargs.pop("key", None)
         key = key or funcname(func)
@@ -1647,10 +1652,11 @@ class Client(Node):
                             st = self.futures[key]
                             exception = st.exception
                             traceback = st.traceback
-                        except (AttributeError, KeyError):
-                            six.reraise(CancelledError, CancelledError(key), None)
+                        except (KeyError, AttributeError):
+                            exc = CancelledError(key)
                         else:
                             six.reraise(type(exception), exception, traceback)
+                        raise exc
                     if errors == "skip":
                         bad_keys.add(key)
                         bad_data[key] = None
@@ -1735,22 +1741,7 @@ class Client(Node):
 
         raise gen.Return(response)
 
-    def _threaded_gather(self, qin, qout, **kwargs):
-        """ Internal function for gathering Queue """
-        while True:
-            L = [qin.get()]
-            while qin.empty():
-                try:
-                    L.append(qin.get_nowait())
-                except Empty:
-                    break
-            results = self.gather(L, **kwargs)
-            for item in results:
-                qout.put(item)
-
-    def gather(
-        self, futures, errors="raise", maxsize=0, direct=None, asynchronous=None
-    ):
+    def gather(self, futures, errors="raise", direct=None, asynchronous=None):
         """ Gather futures from distributed memory
 
         Accepts a future, nested container of futures, iterator, or queue.
@@ -1760,7 +1751,7 @@ class Client(Node):
         ----------
         futures: Collection of futures
             This can be a possibly nested collection of Future objects.
-            Collections can be lists, sets, iterators, queues or dictionaries
+            Collections can be lists, sets, or dictionaries
         errors: string
             Either 'raise' or 'skip' if we should raise if a future has erred
             or skip its inclusion in the output collection
@@ -1768,9 +1759,6 @@ class Client(Node):
             Whether or not to connect directly to the workers, or to ask
             the scheduler to serve as intermediary.  This can also be set when
             creating the Client.
-        maxsize: int
-            If the input is a queue then this produces an output queue with a
-            maximum size.
 
         Returns
         -------
@@ -1787,25 +1775,16 @@ class Client(Node):
         >>> c.gather([x, [x], x])  # support lists and dicts # doctest: +SKIP
         [3, [3], 3]
 
-        >>> seq = c.gather(iter([x, x]))  # support iterators # doctest: +SKIP
-        >>> next(seq)  # doctest: +SKIP
-        3
-
         See Also
         --------
         Client.scatter: Send data out to cluster
         """
         if isqueue(futures):
-            qout = pyQueue(maxsize=maxsize)
-            t = threading.Thread(
-                target=self._threaded_gather,
-                name="Threaded gather()",
-                args=(futures, qout),
-                kwargs={"errors": errors, "direct": direct},
+            raise TypeError(
+                "Dask no longer supports gathering over Iterators and Queues. "
+                "Consider using a normal for loop and Client.submit/gather"
             )
-            t.daemon = True
-            t.start()
-            return qout
+
         elif isinstance(futures, Iterator):
             return (self.gather(f, errors=errors, direct=direct) for f in futures)
         else:
@@ -1932,27 +1911,6 @@ class Client(Node):
             out = list(out.values())[0]
         raise gen.Return(out)
 
-    def _threaded_scatter(self, q_or_i, qout, **kwargs):
-        """ Internal function for scattering Iterable/Queue data """
-        while True:
-            if isqueue(q_or_i):
-                L = [q_or_i.get()]
-                while not q_or_i.empty():
-                    try:
-                        L.append(q_or_i.get_nowait())
-                    except Empty:
-                        break
-            else:
-                try:
-                    L = [next(q_or_i)]
-                except StopIteration as e:
-                    qout.put(e)
-                    break
-
-            futures = self.scatter(L, **kwargs)
-            for future in futures:
-                qout.put(future)
-
     def scatter(
         self,
         data,
@@ -1960,7 +1918,6 @@ class Client(Node):
         broadcast=False,
         direct=None,
         hash=True,
-        maxsize=0,
         timeout=no_default,
         asynchronous=None,
     ):
@@ -1973,7 +1930,7 @@ class Client(Node):
 
         Parameters
         ----------
-        data: list, iterator, dict, Queue, or object
+        data: list, dict, or object
             Data to scatter out to workers.  Output type matches input type.
         workers: list of tuples (optional)
             Optionally constrain locations of data.
@@ -1985,8 +1942,6 @@ class Client(Node):
             Whether or not to connect directly to the workers, or to ask
             the scheduler to serve as intermediary.  This can also be set when
             creating the Client.
-        maxsize: int (optional)
-            Maximum size of queue if using queues, 0 implies infinite
         hash: bool (optional)
             Whether or not to hash data to determine key.
             If False then this uses a random key
@@ -2015,12 +1970,6 @@ class Client(Node):
 
         >>> c.scatter([1, 2, 3], workers=[('hostname', 8788)])   # doctest: +SKIP
 
-        Handle streaming sequences of data with iterators or queues
-
-        >>> seq = c.scatter(iter([1, 2, 3]))  # doctest: +SKIP
-        >>> next(seq)  # doctest: +SKIP
-        <Future: status: finished, key: c0a8a20f903a4915b94db8de3ea63195>,
-
         Broadcast data to all workers
 
         >>> [future] = c.scatter([element], broadcast=True)  # doctest: +SKIP
@@ -2038,38 +1987,26 @@ class Client(Node):
         if timeout == no_default:
             timeout = self._timeout
         if isqueue(data) or isinstance(data, Iterator):
-            logger.debug("Starting thread for streaming data")
-            qout = pyQueue(maxsize=maxsize)
-
-            t = threading.Thread(
-                target=self._threaded_scatter,
-                name="Threaded scatter()",
-                args=(data, qout),
-                kwargs={"workers": workers, "broadcast": broadcast},
+            raise TypeError(
+                "Dask no longer supports mapping over Iterators or Queues."
+                "Consider using a normal for loop and Client.submit"
             )
-            t.daemon = True
-            t.start()
 
-            if isqueue(data):
-                return qout
-            else:
-                return queue_to_iterator(qout)
+        if hasattr(thread_state, "execution_state"):  # within worker task
+            local_worker = thread_state.execution_state["worker"]
         else:
-            if hasattr(thread_state, "execution_state"):  # within worker task
-                local_worker = thread_state.execution_state["worker"]
-            else:
-                local_worker = None
-            return self.sync(
-                self._scatter,
-                data,
-                workers=workers,
-                broadcast=broadcast,
-                direct=direct,
-                local_worker=local_worker,
-                timeout=timeout,
-                asynchronous=asynchronous,
-                hash=hash,
-            )
+            local_worker = None
+        return self.sync(
+            self._scatter,
+            data,
+            workers=workers,
+            broadcast=broadcast,
+            direct=direct,
+            local_worker=local_worker,
+            timeout=timeout,
+            asynchronous=asynchronous,
+            hash=hash,
+        )
 
     @gen.coroutine
     def _cancel(self, futures, force=False):
@@ -2333,6 +2270,10 @@ class Client(Node):
         wait: boolean (optional)
             If the function is asynchronous whether or not to wait until that
             function finishes.
+        nanny : bool, defualt False
+            Whether to run ``function`` on the nanny. By default, the function
+            is run on the worker process.  If specified, the addresses in
+            ``workers`` should still be the worker addresses, not the nanny addresses.
 
         Examples
         --------
@@ -2414,6 +2355,7 @@ class Client(Node):
                 resources = self._expand_resources(
                     resources, all_keys=itertools.chain(dsk, keys)
                 )
+                resources = {tokey(k): v for k, v in resources.items()}
 
             if retries:
                 retries = self._expand_retries(
@@ -3416,7 +3358,7 @@ class Client(Node):
 
         Parameters
         ----------
-        n: int
+        n : int
             Number of logs to retrive.  Maxes out at 10000 by default,
             confiruable in config.yaml::log-length
 
@@ -3426,23 +3368,27 @@ class Client(Node):
         """
         return self.sync(self.scheduler.logs, n=n)
 
-    def get_worker_logs(self, n=None, workers=None):
+    def get_worker_logs(self, n=None, workers=None, nanny=False):
         """ Get logs from workers
 
         Parameters
         ----------
-        n: int
+        n : int
             Number of logs to retrive.  Maxes out at 10000 by default,
             confiruable in config.yaml::log-length
-        workers: iterable
-            List of worker addresses to retrive.  Gets all workers by default.
+        workers : iterable
+            List of worker addresses to retrieve.  Gets all workers by default.
+        nanny : bool, default False
+            Whether to get the logs from the workers (False) or the nannies (True). If
+            specified, the addresses in `workers` should still be the worker addresses,
+            not the nanny addresses.
 
         Returns
         -------
         Dictionary mapping worker address to logs.
         Logs are returned in reversed order (newest first)
         """
-        return self.sync(self.scheduler.worker_logs, n=n, workers=workers)
+        return self.sync(self.scheduler.worker_logs, n=n, workers=workers, nanny=nanny)
 
     def retire_workers(self, workers=None, close_workers=True, **kwargs):
         """ Retire certain workers on the scheduler
@@ -3915,7 +3861,7 @@ class Client(Node):
             from .diagnostics.task_stream import rectangles
 
             rects = rectangles(msgs)
-            from .bokeh.components import task_stream_figure
+            from .dashboard.components import task_stream_figure
 
             source, figure = task_stream_figure(sizing_mode="stretch_both")
             source.data.update(rects)
@@ -3926,17 +3872,6 @@ class Client(Node):
             raise gen.Return((msgs, figure))
         else:
             raise gen.Return(msgs)
-
-    @gen.coroutine
-    def _register_worker_callbacks(self, setup=None):
-        responses = yield self.scheduler.register_worker_callbacks(setup=dumps(setup))
-        results = {}
-        for key, resp in responses.items():
-            if resp["status"] == "OK":
-                results[key] = resp["result"]
-            elif resp["status"] == "error":
-                six.reraise(*clean_exception(**resp))
-        raise gen.Return(results)
 
     def register_worker_callbacks(self, setup=None):
         """
@@ -3956,7 +3891,85 @@ class Client(Node):
         setup : callable(dask_worker: Worker) -> None
             Function to register and run on all workers
         """
-        return self.sync(self._register_worker_callbacks, setup=setup)
+        return self.register_worker_plugin(_WorkerSetupPlugin(setup))
+
+    @gen.coroutine
+    def _register_worker_plugin(self, plugin=None, name=None):
+        responses = yield self.scheduler.register_worker_plugin(
+            plugin=dumps(plugin), name=name
+        )
+        for response in responses.values():
+            if response["status"] == "error":
+                exc = response["exception"]
+                typ = type(exc)
+                tb = response["traceback"]
+                six.reraise(typ, exc, tb)
+        raise gen.Return(responses)
+
+    def register_worker_plugin(self, plugin=None, name=None):
+        """
+        Registers a lifecycle worker plugin for all current and future workers.
+
+        This registers a new object to handle setup and teardown for workers in
+        this cluster. The plugin will instantiate itself on all currently
+        connected workers.  It will also be run on any worker that connects in
+        the future.
+
+        The plugin should be an object with ``setup`` and ``teardown`` methods.
+        It must be serializable with the pickle or cloudpickle modules.
+
+        If the plugin has a ``name`` attribute, or if the ``name=`` keyword is
+        used then that will control idempotency.  A a plugin with that name has
+        already registered then any future plugins will not run.
+
+        For alternatives to plugins, you may also wish to look into preload
+        scripts.
+
+        Parameters
+        ----------
+        plugin: object
+            The plugin object to pass to the workers
+        name: str, optional
+            A name for the plugin.
+            Registering a plugin with the same name will have no effect.
+
+        Examples
+        --------
+        >>> class MyPlugin:
+        ...     def __init__(self, *args, **kwargs):
+        ...         pass  # the constructor is up to you
+        ...     def setup(self, worker: dask.distributed.Worker):
+        ...         pass
+        ...     def teardown(self, worker: dask.distributed.Worker):
+        ...         pass
+
+        >>> plugin = MyPlugin(1, 2, 3)
+        >>> client.register_worker_plugin(plugin)
+
+        You can get access to the plugin with the ``get_worker`` function
+
+        >>> client.register_worker_plugin(other_plugin, name='my-plugin')
+        >>> def f():
+        ...    worker = get_worker()
+        ...    plugin = worker.plugins['my-plugin']
+        ...    return plugin.my_state
+
+        >>> future = client.run(f)
+        """
+        return self.sync(self._register_worker_plugin, plugin=plugin, name=name)
+
+
+class _WorkerSetupPlugin(object):
+    """ This is used to support older setup functions as callbacks """
+
+    def __init__(self, setup):
+        self._setup = setup
+
+    def setup(self, worker):
+        if has_keyword(self._setup, "dask_worker"):
+            return self._setup(dask_worker=worker)
+        else:
+            return self._setup()
 
 
 class Executor(Client):
@@ -4139,7 +4152,10 @@ class as_completed(object):
         except CancelledError:
             pass
         if self.with_results:
-            result = yield future._result(raiseit=False)
+            try:
+                result = yield future._result(raiseit=False)
+            except CancelledError as exc:
+                result = exc
         with self.lock:
             self.futures[future] -= 1
             if not self.futures[future]:

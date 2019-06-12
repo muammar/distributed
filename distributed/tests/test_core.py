@@ -25,7 +25,6 @@ from distributed.metrics import time
 from distributed.protocol import to_serialize
 from distributed.utils import get_ip, get_ipv6
 from distributed.utils_test import (
-    slow,
     gen_test,
     gen_cluster,
     has_ipv6,
@@ -325,7 +324,10 @@ def check_rpc_message_lifetime(*listen_args):
     obj = CountedObject()
     assert CountedObject.n_instances == 1
     del obj
-    assert CountedObject.n_instances == 0
+    start = time()
+    while CountedObject.n_instances != 0:
+        yield gen.sleep(0.01)
+        assert time() < start + 1
 
     with rpc(server.address) as remote:
         obj = CountedObject()
@@ -409,7 +411,7 @@ def check_large_packets(listen_arg):
     server.stop()
 
 
-@slow
+@pytest.mark.slow
 @gen_test()
 def test_large_packets_tcp():
     yield check_large_packets("tcp://")

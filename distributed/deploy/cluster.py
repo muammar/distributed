@@ -1,12 +1,23 @@
+from datetime import timedelta
 import logging
 import os
 from weakref import ref
 
 import dask
+from tornado import gen
 
 from .adaptive import Adaptive
 
-from ..utils import format_bytes, PeriodicCallback, log_errors, ignoring
+from ..compatibility import get_thread_identity
+from ..utils import (
+    format_bytes,
+    PeriodicCallback,
+    log_errors,
+    ignoring,
+    sync,
+    thread_state,
+)
+
 
 logger = logging.getLogger(__name__)
 
@@ -77,7 +88,7 @@ class Cluster(object):
     def dashboard_link(self):
         template = dask.config.get("distributed.dashboard.link")
         host = self.scheduler.address.split("://")[1].split(":")[0]
-        port = self.scheduler.services["bokeh"].port
+        port = self.scheduler.services["dashboard"].port
         return template.format(host=host, port=port, **os.environ)
 
     def scale(self, n):
@@ -154,7 +165,7 @@ class Cluster(object):
 
         layout = Layout(width="150px")
 
-        if "bokeh" in self.scheduler.services:
+        if "dashboard" in self.scheduler.services:
             link = self.dashboard_link
             link = '<p><b>Dashboard: </b><a href="%s" target="_blank">%s</a></p>\n' % (
                 link,
@@ -215,3 +226,22 @@ class Cluster(object):
 
     def _ipython_display_(self, **kwargs):
         return self._widget()._ipython_display_(**kwargs)
+
+    @property
+    def asynchronous(self):
+        return (
+            self._asynchronous
+            or getattr(thread_state, "asynchronous", False)
+            or hasattr(self.loop, "_thread_identity")
+            and self.loop._thread_identity == get_thread_identity()
+        )
+
+    def sync(self, func, *args, **kwargs):
+        if kwargs.pop("asynchronous", None) or self.asynchronous:
+            callback_timeout = kwargs.pop("callback_timeout", None)
+            future = func(*args, **kwargs)
+            if callback_timeout is not None:
+                future = gen.with_timeout(timedelta(seconds=callback_timeout), future)
+            return future
+        else:
+            return sync(self.loop, func, *args, **kwargs)

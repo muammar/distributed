@@ -17,8 +17,8 @@ from distributed.utils import tokey
 from distributed.client import wait
 from distributed.metrics import time
 from distributed.utils_test import gen_cluster, inc, dec, slowinc, div
-from distributed.bokeh.worker import Counters, BokehWorker
-from distributed.bokeh.scheduler import (
+from distributed.dashboard.worker import Counters, BokehWorker
+from distributed.dashboard.scheduler import (
     BokehScheduler,
     SystemMonitor,
     Occupancy,
@@ -36,7 +36,7 @@ from distributed.bokeh.scheduler import (
     ProfileServer,
 )
 
-from distributed.bokeh import scheduler
+from distributed.dashboard import scheduler
 
 scheduler.PROFILING = False
 
@@ -44,10 +44,12 @@ scheduler.PROFILING = False
 @pytest.mark.skipif(
     sys.version_info[0] == 2, reason="https://github.com/bokeh/bokeh/issues/5494"
 )
-@gen_cluster(client=True, scheduler_kwargs={"services": {("bokeh", 0): BokehScheduler}})
+@gen_cluster(
+    client=True, scheduler_kwargs={"services": {("dashboard", 0): BokehScheduler}}
+)
 def test_simple(c, s, a, b):
-    assert isinstance(s.services["bokeh"], BokehScheduler)
-    port = s.services["bokeh"].port
+    assert isinstance(s.services["dashboard"], BokehScheduler)
+    port = s.services["dashboard"].port
 
     future = c.submit(sleep, 1)
     yield gen.sleep(0.1)
@@ -80,7 +82,7 @@ def test_simple(c, s, a, b):
     assert response
 
 
-@gen_cluster(client=True, worker_kwargs=dict(services={"bokeh": BokehWorker}))
+@gen_cluster(client=True, worker_kwargs=dict(services={"dashboard": BokehWorker}))
 def test_basic(c, s, a, b):
     for component in [SystemMonitor, Occupancy, StealingTimeSeries]:
         ss = component(s)
@@ -89,7 +91,7 @@ def test_basic(c, s, a, b):
         data = ss.source.data
         assert len(first(data.values()))
         if component is Occupancy:
-            assert all(addr.startswith("127.0.0.1:") for addr in data["bokeh_address"])
+            assert all(addr == "127.0.0.1" for addr in data["dashboard_host"])
 
 
 @gen_cluster(client=True)
@@ -352,7 +354,7 @@ def test_WorkerTable_custom_metrics(c, s, a, b):
 
     assert all(data.values())
     assert all(len(v) == 2 for v in data.values())
-    my_index = data["worker"].index(a.address), data["worker"].index(b.address)
+    my_index = data["address"].index(a.address), data["address"].index(b.address)
     assert [data["metric_port"][i] for i in my_index] == [a.port, b.port]
     assert [data["metric_address"][i] for i in my_index] == [a.address, b.address]
 
@@ -377,7 +379,7 @@ def test_WorkerTable_different_metrics(c, s, a, b):
     assert "metric_b" in data
     assert all(data.values())
     assert all(len(v) == 2 for v in data.values())
-    my_index = data["worker"].index(a.address), data["worker"].index(b.address)
+    my_index = data["address"].index(a.address), data["address"].index(b.address)
     assert [data["metric_a"][i] for i in my_index] == [a.port, None]
     assert [data["metric_b"][i] for i in my_index] == [None, b.port]
 
@@ -397,7 +399,7 @@ def test_WorkerTable_metrics_with_different_metric_2(c, s, a, b):
     assert "metric_a" in data
     assert all(data.values())
     assert all(len(v) == 2 for v in data.values())
-    my_index = data["worker"].index(a.address), data["worker"].index(b.address)
+    my_index = data["address"].index(a.address), data["address"].index(b.address)
     assert [data["metric_a"][i] for i in my_index] == [a.port, None]
 
 
@@ -565,17 +567,63 @@ def test_GraphPlot_order(c, s, a, b):
 )
 def test_profile_server(c, s, a, b):
     ptp = ProfileServer(s)
-    ptp.trigger_update()
-    yield gen.sleep(0.200)
-    ptp.trigger_update()
-    assert 2 < len(ptp.ts_source.data["time"]) < 20
+    start = time()
+    yield gen.sleep(0.100)
+    while len(ptp.ts_source.data["time"]) < 2:
+        yield gen.sleep(0.100)
+        ptp.trigger_update()
+        assert time() < start + 2
 
 
-@gen_cluster(client=True, scheduler_kwargs={"services": {("bokeh", 0): BokehScheduler}})
+@gen_cluster(
+    client=True, scheduler_kwargs={"services": {("dashboard", 0): BokehScheduler}}
+)
 def test_root_redirect(c, s, a, b):
     http_client = AsyncHTTPClient()
     response = yield http_client.fetch(
-        "http://localhost:%d/" % s.services["bokeh"].port
+        "http://localhost:%d/" % s.services["dashboard"].port
     )
     assert response.code == 200
     assert "/status" in response.effective_url
+
+
+@gen_cluster(
+    client=True,
+    scheduler_kwargs={"services": {("dashboard", 0): BokehScheduler}},
+    worker_kwargs={"services": {"dashboard": BokehWorker}},
+    timeout=180,
+)
+def test_proxy_to_workers(c, s, a, b):
+    try:
+        import jupyter_server_proxy  # noqa: F401
+
+        proxy_exists = True
+    except ImportError:
+        proxy_exists = False
+
+    dashboard_port = s.services["dashboard"].port
+    http_client = AsyncHTTPClient()
+    response = yield http_client.fetch("http://localhost:%d/" % dashboard_port)
+    assert response.code == 200
+    assert "/status" in response.effective_url
+
+    for w in [a, b]:
+        host = w.ip
+        port = w.service_ports["dashboard"]
+        proxy_url = "http://localhost:%d/proxy/%s/%s/status" % (
+            dashboard_port,
+            port,
+            host,
+        )
+        direct_url = "http://localhost:%s/status" % port
+        http_client = AsyncHTTPClient()
+        response_proxy = yield http_client.fetch(proxy_url)
+        response_direct = yield http_client.fetch(direct_url)
+
+        assert response_proxy.code == 200
+        if proxy_exists:
+            assert b"Crossfilter" in response_proxy.body
+        else:
+            assert b"pip install jupyter-server-proxy" in response_proxy.body
+        assert response_direct.code == 200
+        assert b"Crossfilter" in response_direct.body

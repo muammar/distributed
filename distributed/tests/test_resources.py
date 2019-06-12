@@ -19,8 +19,8 @@ def test_resources(c, s):
     assert not s.worker_resources
     assert not s.resources
 
-    a = Worker(s.ip, s.port, loop=s.loop, resources={"GPU": 2})
-    b = Worker(s.ip, s.port, loop=s.loop, resources={"GPU": 1, "DB": 1})
+    a = Worker(s.address, loop=s.loop, resources={"GPU": 2})
+    b = Worker(s.address, loop=s.loop, resources={"GPU": 1, "DB": 1})
 
     yield [a, b]
 
@@ -55,7 +55,7 @@ def test_resource_submit(c, s, a, b):
 
     assert s.get_task_status(keys=[z.key]) == {z.key: "no-worker"}
 
-    d = yield Worker(s.ip, s.port, loop=s.loop, resources={"C": 10})
+    d = yield Worker(s.address, loop=s.loop, resources={"C": 10})
 
     yield wait(z)
     assert z.key in d.data
@@ -200,6 +200,24 @@ def test_persist_tuple(c, s, a, b):
     assert x.key in a.data
     assert y.key in a.data
     assert not b.data
+
+
+@gen_cluster(client=True)
+def test_resources_str(c, s, a, b):
+    pd = pytest.importorskip("pandas")
+    dd = pytest.importorskip("dask.dataframe")
+
+    yield a.set_resources(MyRes=1)
+
+    x = dd.from_pandas(pd.DataFrame({"A": [1, 2], "B": [3, 4]}), npartitions=1)
+    y = x.apply(lambda row: row.sum(), axis=1, meta=(None, "int64"))
+    yy = y.persist(resources={"MyRes": 1})
+    yield wait(yy)
+
+    ts_first = s.tasks[tokey(y.__dask_keys__()[0])]
+    assert ts_first.resource_restrictions == {"MyRes": 1}
+    ts_last = s.tasks[tokey(y.__dask_keys__()[-1])]
+    assert ts_last.resource_restrictions == {"MyRes": 1}
 
 
 @gen_cluster(

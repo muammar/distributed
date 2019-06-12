@@ -6,8 +6,8 @@ from toolz import frequencies, pluck
 from tornado import gen
 from tornado.ioloop import IOLoop
 
-from distributed import Client, wait, Adaptive, LocalCluster
-from distributed.utils_test import gen_cluster, gen_test, slowinc, inc
+from distributed import Client, wait, Adaptive, LocalCluster, SpecCluster, Worker
+from distributed.utils_test import gen_cluster, gen_test, slowinc, clean
 from distributed.utils_test import loop, nodebug  # noqa: F401
 from distributed.metrics import time
 
@@ -115,11 +115,10 @@ def test_adaptive_local_cluster_multi_workers():
             yield gen.sleep(0.01)
             assert time() < start + 15, alc.log
 
-        # assert not cluster.workers
-        assert not cluster.scheduler.workers
-        yield gen.sleep(0.2)
-        # assert not cluster.workers
-        assert not cluster.scheduler.workers
+        # no workers for a while
+        for i in range(10):
+            assert not cluster.scheduler.workers
+            yield gen.sleep(0.05)
 
         futures = c.map(slowinc, range(100), delay=0.01)
         yield c.gather(futures)
@@ -151,6 +150,10 @@ def test_adaptive_scale_down_override(c, s, *workers):
         def scale_down(self, workers):
             assert False
 
+        @property
+        def workers(self):
+            return s.workers
+
     assert len(s.workers) == 10
 
     # Assert that adaptive cycle does not reduce cluster below minimum size
@@ -162,19 +165,16 @@ def test_adaptive_scale_down_override(c, s, *workers):
     assert len(s.workers) == 2
 
 
-@gen_test(timeout=30)
+@gen_test()
 def test_min_max():
-    loop = IOLoop.current()
     cluster = yield LocalCluster(
         0,
         scheduler_port=0,
         silence_logs=False,
         processes=False,
         dashboard_address=None,
-        loop=loop,
         asynchronous=True,
     )
-    yield cluster._start()
     try:
         adapt = Adaptive(
             cluster.scheduler,
@@ -184,7 +184,7 @@ def test_min_max():
             interval="20 ms",
             wait_count=10,
         )
-        c = yield Client(cluster, asynchronous=True, loop=loop)
+        c = yield Client(cluster, asynchronous=True)
 
         start = time()
         while not cluster.scheduler.workers:
@@ -243,7 +243,9 @@ def test_avoid_churn():
             yield client.submit(slowinc, i, delay=0.040)
             yield gen.sleep(0.040)
 
-        assert frequencies(pluck(1, adapt.log)) == {"up": 1}
+        from toolz.curried import pipe, unique, pluck, frequencies
+
+        assert pipe(adapt.log, unique(key=str), pluck(1), frequencies) == {"up": 1}
     finally:
         yield client.close()
         yield cluster.close()
@@ -359,17 +361,18 @@ def test_no_more_workers_than_tasks():
 
 
 def test_basic_no_loop():
-    try:
-        with LocalCluster(
-            0, scheduler_port=0, silence_logs=False, dashboard_address=None
-        ) as cluster:
-            with Client(cluster) as client:
-                cluster.adapt()
-                future = client.submit(lambda x: x + 1, 1)
-                assert future.result() == 2
-            loop = cluster.loop
-    finally:
-        loop.add_callback(loop.stop)
+    with clean(threads=False):
+        try:
+            with LocalCluster(
+                0, scheduler_port=0, silence_logs=False, dashboard_address=None
+            ) as cluster:
+                with Client(cluster) as client:
+                    cluster.adapt()
+                    future = client.submit(lambda x: x + 1, 1)
+                    assert future.result() == 2
+                loop = cluster.loop
+        finally:
+            loop.add_callback(loop.stop)
 
 
 @gen_test(timeout=None)
@@ -408,25 +411,17 @@ def test_target_duration():
 @gen_test(timeout=None)
 def test_worker_keys():
     """ Ensure that redefining adapt with a lower maximum removes workers """
-    cluster = yield LocalCluster(
-        0,
+    cluster = yield SpecCluster(
+        workers={
+            "a-1": {"cls": Worker},
+            "a-2": {"cls": Worker},
+            "b-1": {"cls": Worker},
+            "b-2": {"cls": Worker},
+        },
         asynchronous=True,
-        processes=False,
-        scheduler_port=0,
-        silence_logs=False,
-        dashboard_address=None,
     )
 
     try:
-        yield [
-            cluster.start_worker(name="a-1"),
-            cluster.start_worker(name="a-2"),
-            cluster.start_worker(name="b-1"),
-            cluster.start_worker(name="b-2"),
-        ]
-
-        while len(cluster.scheduler.workers) != 4:
-            yield gen.sleep(0.01)
 
         def key(ws):
             return ws.name.split("-")[0]
@@ -443,15 +438,3 @@ def test_worker_keys():
         assert names == {"a-1", "a-2"} or names == {"b-1", "b-2"}
     finally:
         yield cluster.close()
-
-
-@gen_cluster(client=True, ncores=[])
-def test_without_cluster(c, s):
-    adapt = Adaptive(scheduler=s)
-
-    future = c.submit(inc, 1)
-    while not s.tasks:
-        yield gen.sleep(0.01)
-
-    response = yield c.scheduler.adaptive_recommendations()
-    assert response["status"] == "up"

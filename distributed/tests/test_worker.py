@@ -1,6 +1,7 @@
 from __future__ import print_function, division, absolute_import
 
 from concurrent.futures import ThreadPoolExecutor
+from datetime import timedelta
 import logging
 from numbers import Number
 from operator import add
@@ -25,7 +26,7 @@ from distributed.core import rpc
 from distributed.client import wait
 from distributed.scheduler import Scheduler
 from distributed.metrics import time
-from distributed.worker import Worker, error_message, logger
+from distributed.worker import Worker, error_message, logger, parse_memory_limit
 from distributed.utils import tmpfile, format_bytes
 from distributed.utils_test import (
     inc,
@@ -33,7 +34,6 @@ from distributed.utils_test import (
     gen_cluster,
     div,
     dec,
-    slow,
     slowinc,
     gen_test,
     captured_logger,
@@ -147,7 +147,7 @@ def test_worker_bad_args(c, s, a, b):
     assert tuple(results) == (3, 7)
 
 
-@slow
+@pytest.mark.slow
 @gen_cluster()
 def dont_test_delete_data_with_missing_worker(c, a, b):
     bad = "127.0.0.1:9001"  # this worker doesn't exist
@@ -304,8 +304,7 @@ def test_broadcast(s, a, b):
 
 @gen_test()
 def test_worker_with_port_zero():
-    s = Scheduler()
-    s.start(8007)
+    s = yield Scheduler(port=8007)
     w = yield Worker(s.address)
     assert isinstance(w.port, int)
     assert w.port > 1024
@@ -313,16 +312,21 @@ def test_worker_with_port_zero():
     yield w.close()
 
 
-@slow
-def test_worker_waits_for_center_to_come_up(loop):
+@pytest.mark.slow
+def test_worker_waits_for_scheduler(loop):
     @gen.coroutine
     def f():
-        w = yield Worker("127.0.0.1", 8007)
+        w = Worker("127.0.0.1", 8007)
+        try:
+            yield gen.with_timeout(timedelta(seconds=3), w)
+        except TimeoutError:
+            pass
+        else:
+            assert False
+        assert w.status not in ("closed", "running")
+        yield w.close(timeout=0.1)
 
-    try:
-        loop.run_sync(f, timeout=4)
-    except TimeoutError:
-        pass
+    loop.run_sync(f)
 
 
 @gen_cluster(client=True, ncores=[("127.0.0.1", 1)])
@@ -357,12 +361,13 @@ def test_gather(s, a, b):
         assert a.data["y"] == b.data["y"]
 
 
-def test_io_loop(loop):
-    s = Scheduler(loop=loop)
-    s.listen(0)
-    assert s.io_loop is loop
-    w = Worker(s.address, loop=loop)
-    assert w.io_loop is loop
+@pytest.mark.asyncio
+async def test_io_loop():
+    s = await Scheduler(port=0)
+    w = await Worker(s.address, loop=s.loop)
+    assert w.io_loop is s.loop
+    await s.close()
+    await w.close()
 
 
 @gen_cluster(client=True, ncores=[])
@@ -382,17 +387,22 @@ def test_spill_to_disk(c, s):
     yield wait(y)
 
     assert set(w.data) == {x.key, y.key}
-    assert set(w.data.fast) == {x.key, y.key}
+    assert set(w.data.memory) == {x.key, y.key}
+    assert set(w.data.fast) == set(w.data.memory)
 
     z = c.submit(np.random.randint, 0, 255, size=500, dtype="u1", key="z")
     yield wait(z)
     assert set(w.data) == {x.key, y.key, z.key}
-    assert set(w.data.fast) == {y.key, z.key}
-    assert set(w.data.slow) == {x.key} or set(w.data.slow) == {x.key, y.key}
+    assert set(w.data.memory) == {y.key, z.key}
+    assert set(w.data.disk) == {x.key} or set(w.data.slow) == {x.key, y.key}
+    assert set(w.data.fast) == set(w.data.memory)
+    assert set(w.data.slow) == set(w.data.disk)
 
     yield x
-    assert set(w.data.fast) == {x.key, z.key}
-    assert set(w.data.slow) == {y.key} or set(w.data.slow) == {x.key, y.key}
+    assert set(w.data.memory) == {x.key, z.key}
+    assert set(w.data.disk) == {y.key} or set(w.data.slow) == {x.key, y.key}
+    assert set(w.data.fast) == set(w.data.memory)
+    assert set(w.data.slow) == set(w.data.disk)
     yield w.close()
 
 
@@ -434,7 +444,7 @@ def test_run_coroutine_dask_worker(c, s, a, b):
 @gen_cluster(client=True, ncores=[])
 def test_Executor(c, s):
     with ThreadPoolExecutor(2) as e:
-        w = Worker(s.ip, s.port, executor=e)
+        w = Worker(s.address, executor=e)
         assert w.executor is e
         w = yield w
 
@@ -461,7 +471,7 @@ def test_spill_by_default(c, s, w):
     x = da.ones(int(10e6 * 0.7), chunks=1e6, dtype="u1")
     y = c.persist(x)
     yield wait(y)
-    assert len(w.data.slow)  # something is on disk
+    assert len(w.data.disk)  # something is on disk
     del x, y
 
 
@@ -722,7 +732,7 @@ def test_hold_onto_dependents(c, s, a, b):
     assert x.key in b.data
 
 
-@slow
+@pytest.mark.slow
 @gen_cluster(client=False, ncores=[])
 def test_worker_death_timeout(s):
     with dask.config.set({"distributed.comm.timeouts.connect": "1s"}):
@@ -931,14 +941,9 @@ def test_get_client_coroutine_sync(client, s, a, b):
 
 @gen_cluster()
 def test_global_workers(s, a, b):
-    from distributed.worker import _global_workers
-
-    n = len(_global_workers)
-    w = _global_workers[-1]()
+    n = len(Worker._instances)
+    w = first(Worker._instances)
     assert w is a or w is b
-    yield a.close()
-    yield b.close()
-    assert len(_global_workers) == n - 2
 
 
 @pytest.mark.skipif(WINDOWS, reason="file descriptors")
@@ -967,25 +972,25 @@ def test_worker_fds(s):
 @gen_cluster(ncores=[])
 def test_service_hosts_match_worker(s):
     pytest.importorskip("bokeh")
-    from distributed.bokeh.worker import BokehWorker
+    from distributed.dashboard import BokehWorker
 
-    services = {("bokeh", ":0"): BokehWorker}
+    services = {("dashboard", ":0"): BokehWorker}
 
-    w = Worker(s.address, services={("bokeh", ":0"): BokehWorker})
+    w = Worker(s.address, services={("dashboard", ":0"): BokehWorker})
     yield w._start("tcp://0.0.0.0")
-    sock = first(w.services["bokeh"].server._http._sockets.values())
+    sock = first(w.services["dashboard"].server._http._sockets.values())
     assert sock.getsockname()[0] in ("::", "0.0.0.0")
     yield w.close()
 
-    w = Worker(s.address, services={("bokeh", ":0"): BokehWorker})
+    w = Worker(s.address, services={("dashboard", ":0"): BokehWorker})
     yield w._start("tcp://127.0.0.1")
-    sock = first(w.services["bokeh"].server._http._sockets.values())
+    sock = first(w.services["dashboard"].server._http._sockets.values())
     assert sock.getsockname()[0] in ("::", "0.0.0.0")
     yield w.close()
 
-    w = Worker(s.address, services={("bokeh", 0): BokehWorker})
+    w = Worker(s.address, services={("dashboard", 0): BokehWorker})
     yield w._start("tcp://127.0.0.1")
-    sock = first(w.services["bokeh"].server._http._sockets.values())
+    sock = first(w.services["dashboard"].server._http._sockets.values())
     assert sock.getsockname()[0] == "127.0.0.1"
     yield w.close()
 
@@ -993,22 +998,21 @@ def test_service_hosts_match_worker(s):
 @gen_cluster(ncores=[])
 def test_start_services(s):
     pytest.importorskip("bokeh")
-    from distributed.bokeh.worker import BokehWorker
+    from distributed.dashboard import BokehWorker
 
-    services = {("bokeh", ":1234"): BokehWorker}
+    services = {("dashboard", ":1234"): BokehWorker}
 
     w = Worker(s.address, services=services)
     yield w._start()
 
-    assert w.services["bokeh"].server.port == 1234
+    assert w.services["dashboard"].server.port == 1234
     yield w.close()
 
 
 @gen_test()
 def test_scheduler_file():
     with tmpfile() as fn:
-        s = Scheduler(scheduler_file=fn)
-        s.start(8009)
+        s = yield Scheduler(scheduler_file=fn, port=8009)
         w = yield Worker(scheduler_file=fn)
         assert set(s.workers) == {w.address}
         yield w.close()
@@ -1071,7 +1075,7 @@ def test_robust_to_bad_sizeof_estimates(c, s, a):
     futures = c.map(f, [100e6] * 8, pure=False)
 
     start = time()
-    while not a.data.slow:
+    while not a.data.disk:
         yield gen.sleep(0.1)
         assert time() < start + 5
 
@@ -1232,7 +1236,7 @@ def test_scheduler_address_config(c, s):
     yield worker.close()
 
 
-@slow
+@pytest.mark.slow
 @gen_cluster(client=True)
 def test_wait_for_outgoing(c, s, a, b):
     np = pytest.importorskip("numpy")
@@ -1315,7 +1319,6 @@ def test_register_worker_callbacks(c, s, a, b):
         return os.getenv("MY_ENV_VALUE", None) == "WORKER_ENV_VALUE"
 
     # Nothing has been run yet
-    assert len(s.worker_setups) == 0
     result = yield c.run(test_import)
     assert list(result.values()) == [False] * 2
     result = yield c.run(test_startup2)
@@ -1330,7 +1333,6 @@ def test_register_worker_callbacks(c, s, a, b):
     # Add a preload function
     response = yield c.register_worker_callbacks(setup=mystartup)
     assert len(response) == 2
-    assert len(s.worker_setups) == 1
 
     # Check it has been ran on existing worker
     result = yield c.run(test_import)
@@ -1345,7 +1347,6 @@ def test_register_worker_callbacks(c, s, a, b):
     # Register another preload function
     response = yield c.register_worker_callbacks(setup=mystartup2)
     assert len(response) == 2
-    assert len(s.worker_setups) == 2
 
     # Check it has been run
     result = yield c.run(test_startup2)
@@ -1359,7 +1360,9 @@ def test_register_worker_callbacks(c, s, a, b):
     assert list(result.values()) == [True]
     yield worker.close()
 
-    # Final exception test
+
+@gen_cluster(client=True)
+def test_register_worker_callbacks_err(c, s, a, b):
     with pytest.raises(ZeroDivisionError):
         yield c.register_worker_callbacks(setup=lambda: 1 / 0)
 
@@ -1384,3 +1387,49 @@ def test_data_types(s):
     assert w.data.x == 123
     assert w.data.y == 456
     yield w.close()
+
+
+@gen_cluster(ncores=[])
+def test_local_dir(s):
+    with tmpfile() as fn:
+        with dask.config.set(temporary_directory=fn):
+            w = yield Worker(s.address)
+            assert w.local_dir.startswith(fn)
+            assert "dask-worker-space" in w.local_dir
+
+
+@pytest.mark.skipif(
+    not sys.platform.startswith("linux"), reason="Need 127.0.0.2 to mean localhost"
+)
+@gen_cluster(ncores=[], client=True)
+def test_host_address(c, s):
+    w = yield Worker(s.address, host="127.0.0.2")
+    assert "127.0.0.2" in w.address
+    yield w.close()
+
+    n = yield Nanny(s.address, host="127.0.0.3")
+    assert "127.0.0.3" in n.address
+    assert "127.0.0.3" in n.worker_address
+    yield n.close()
+
+
+def test_resource_limit():
+    assert parse_memory_limit("250MiB", 1, total_cores=1) == 1024 * 1024 * 250
+
+    # get current limit
+    resource = pytest.importorskip("resource")
+    try:
+        hard_limit = resource.getrlimit(resource.RLIMIT_RSS)[1]
+    except OSError:
+        pytest.skip("resource could not get the RSS limit")
+    memory_limit = psutil.virtual_memory().total
+    if hard_limit > memory_limit or hard_limit < 0:
+        hard_limit = memory_limit
+
+    # decrease memory limit by one byte
+    new_limit = hard_limit - 1
+    try:
+        resource.setrlimit(resource.RLIMIT_RSS, (new_limit, new_limit))
+        assert parse_memory_limit(hard_limit, 1, total_cores=1) == new_limit
+    except OSError:
+        pytest.skip("resource could not set the RSS limit")

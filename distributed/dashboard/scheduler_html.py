@@ -1,27 +1,16 @@
 from datetime import datetime
-import os
 
 import toolz
 from tornado import escape
 from tornado import gen
-from tornado import web
 
 from ..utils import log_errors, format_bytes, format_time
-
-dirname = os.path.dirname(__file__)
+from .proxy import GlobalProxyHandler
+from .utils import RequestHandler, redirect
 
 ns = {
     func.__name__: func for func in [format_bytes, format_time, datetime.fromtimestamp]
 }
-
-
-class RequestHandler(web.RequestHandler):
-    def initialize(self, server=None, extra=None):
-        self.server = server
-        self.extra = extra or {}
-
-    def get_template_path(self):
-        return os.path.join(dirname, "templates")
 
 
 class Workers(RequestHandler):
@@ -42,6 +31,7 @@ class Worker(RequestHandler):
             self.render(
                 "worker.html",
                 title="Worker: " + worker,
+                scheduler=self.server,
                 Worker=worker,
                 **toolz.merge(self.server.__dict__, ns, self.extra)
             )
@@ -55,7 +45,7 @@ class Task(RequestHandler):
                 "task.html",
                 title="Task: " + task,
                 Task=task,
-                server=self.server,
+                scheduler=self.server,
                 **toolz.merge(self.server.__dict__, ns, self.extra)
             )
 
@@ -175,7 +165,7 @@ class IndexJSON(RequestHandler):
 
 class IndividualPlots(RequestHandler):
     def get(self):
-        bokeh_server = self.server.services["bokeh"]
+        bokeh_server = self.server.services["dashboard"]
         result = {
             uri.strip("/").replace("-", " ").title(): uri
             for uri in bokeh_server.apps
@@ -185,17 +175,18 @@ class IndividualPlots(RequestHandler):
 
 
 class _PrometheusCollector(object):
-    def __init__(self, server, prometheus_client):
+    def __init__(self, server):
         self.server = server
-        self.prometheus_client = prometheus_client
 
     def collect(self):
-        yield self.prometheus_client.core.GaugeMetricFamily(
+        from prometheus_client.core import GaugeMetricFamily
+
+        yield GaugeMetricFamily(
             "dask_scheduler_workers",
             "Number of workers.",
             value=len(self.server.workers),
         )
-        yield self.prometheus_client.core.GaugeMetricFamily(
+        yield GaugeMetricFamily(
             "dask_scheduler_clients",
             "Number of clients.",
             value=len(self.server.clients),
@@ -206,26 +197,21 @@ class PrometheusHandler(RequestHandler):
     _initialized = False
 
     def __init__(self, *args, **kwargs):
-        import prometheus_client  # keep out of global namespace
-
-        self.prometheus_client = prometheus_client
+        import prometheus_client
 
         super(PrometheusHandler, self).__init__(*args, **kwargs)
 
-        self._init()
-
-    def _init(self):
         if PrometheusHandler._initialized:
             return
 
-        self.prometheus_client.REGISTRY.register(
-            _PrometheusCollector(self.server, self.prometheus_client)
-        )
+        prometheus_client.REGISTRY.register(_PrometheusCollector(self.server))
 
         PrometheusHandler._initialized = True
 
     def get(self):
-        self.write(self.prometheus_client.generate_latest())
+        import prometheus_client
+
+        self.write(prometheus_client.generate_latest())
         self.set_header("Content-Type", "text/plain; version=0.0.4")
 
 
@@ -236,6 +222,7 @@ class HealthHandler(RequestHandler):
 
 
 routes = [
+    (r"info", redirect("info/main/workers.html")),
     (r"info/main/workers.html", Workers),
     (r"info/worker/(.*).html", Worker),
     (r"info/task/(.*).html", Task),
@@ -249,6 +236,7 @@ routes = [
     (r"individual-plots.json", IndividualPlots),
     (r"metrics", PrometheusHandler),
     (r"health", HealthHandler),
+    (r"proxy/(\d+)/(.*?)/(.*)", GlobalProxyHandler),
 ]
 
 
