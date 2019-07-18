@@ -1,21 +1,20 @@
 from datetime import timedelta
 import logging
-import os
 from weakref import ref
 
-import dask
+from dask.utils import format_bytes
 from tornado import gen
 
 from .adaptive import Adaptive
 
 from ..compatibility import get_thread_identity
 from ..utils import (
-    format_bytes,
     PeriodicCallback,
     log_errors,
     ignoring,
     sync,
     thread_state,
+    format_dashboard_link,
 )
 
 
@@ -86,10 +85,9 @@ class Cluster(object):
 
     @property
     def dashboard_link(self):
-        template = dask.config.get("distributed.dashboard.link")
         host = self.scheduler.address.split("://")[1].split(":")[0]
         port = self.scheduler.services["dashboard"].port
-        return template.format(host=host, port=port, **os.environ)
+        return format_dashboard_link(host, port)
 
     def scale(self, n):
         """ Scale cluster to n workers
@@ -123,7 +121,7 @@ class Cluster(object):
 
     def _widget_status(self):
         workers = len(self.scheduler.workers)
-        cores = sum(ws.ncores for ws in self.scheduler.workers.values())
+        cores = sum(ws.nthreads for ws in self.scheduler.workers.values())
         memory = sum(ws.memory_limit for ws in self.scheduler.workers.values())
         memory = format_bytes(memory)
         text = """
@@ -236,9 +234,9 @@ class Cluster(object):
             and self.loop._thread_identity == get_thread_identity()
         )
 
-    def sync(self, func, *args, **kwargs):
-        if kwargs.pop("asynchronous", None) or self.asynchronous:
-            callback_timeout = kwargs.pop("callback_timeout", None)
+    def sync(self, func, *args, asynchronous=None, callback_timeout=None, **kwargs):
+        asynchronous = asynchronous or self.asynchronous
+        if asynchronous:
             future = func(*args, **kwargs)
             if callback_timeout is not None:
                 future = gen.with_timeout(timedelta(seconds=callback_timeout), future)

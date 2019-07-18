@@ -22,6 +22,7 @@ from bokeh.models.widgets import DataTable, TableColumn
 from bokeh.plotting import figure
 from bokeh.palettes import RdBu
 from bokeh.themes import Theme
+from dask.utils import format_bytes
 from toolz import merge, partition_all
 
 from .components import (
@@ -35,7 +36,7 @@ from .utils import transpose, without_property_validation
 from ..compatibility import WINDOWS
 from ..diagnostics.progress_stream import color_of
 from ..metrics import time
-from ..utils import log_errors, key_split, format_bytes, format_time
+from ..utils import log_errors, key_split, format_time
 
 
 logger = logging.getLogger(__name__)
@@ -76,7 +77,7 @@ class StateTable(DashboardComponent):
             w = self.worker
             d = {
                 "Stored": [len(w.data)],
-                "Executing": ["%d / %d" % (len(w.executing), w.ncores)],
+                "Executing": ["%d / %d" % (len(w.executing), w.nthreads)],
                 "Ready": [len(w.ready)],
                 "Waiting": [len(w.waiting_for_data)],
                 "Connections": [len(w.in_flight_workers)],
@@ -251,7 +252,7 @@ class ExecutingTimeSeries(DashboardComponent):
         fig = figure(
             title="Executing History",
             x_axis_type="datetime",
-            y_range=[-0.1, worker.ncores + 0.1],
+            y_range=[-0.1, worker.nthreads + 0.1],
             height=150,
             tools="",
             x_range=x_range,

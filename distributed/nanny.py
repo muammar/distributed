@@ -3,6 +3,7 @@ from __future__ import print_function, division, absolute_import
 from datetime import timedelta
 import logging
 from multiprocessing.queues import Empty
+import multiprocessing
 import os
 import psutil
 import shutil
@@ -32,7 +33,7 @@ from .utils import (
     PeriodicCallback,
     parse_timedelta,
 )
-from .worker import _ncores, run, parse_memory_limit, Worker
+from .worker import run, parse_memory_limit, Worker
 
 logger = logging.getLogger(__name__)
 
@@ -41,7 +42,15 @@ class Nanny(ServerNode):
     """ A process to manage worker processes
 
     The nanny spins up Worker processes, watches then, and kills or restarts
-    them as necessary.
+    them as necessary. It is necessary if you want to use the
+    ``Client.restart`` method, or to restart the worker automatically if
+    it gets to the terminate fractiom of its memory limit.
+
+    The parameters for the Nanny are mostly the same as those for the Worker.
+
+    See Also
+    --------
+    Worker
     """
 
     _instances = weakref.WeakSet()
@@ -54,6 +63,7 @@ class Nanny(ServerNode):
         scheduler_port=None,
         scheduler_file=None,
         worker_port=0,
+        nthreads=None,
         ncores=None,
         loop=None,
         local_dir="dask-worker-space",
@@ -96,8 +106,12 @@ class Nanny(ServerNode):
         else:
             self.scheduler_addr = coerce_to_address((scheduler_ip, scheduler_port))
 
+        if ncores is not None:
+            warnings.warn("the ncores= parameter has moved to nthreads=")
+            nthreads = ncores
+
         self._given_worker_port = worker_port
-        self.ncores = ncores or _ncores
+        self.nthreads = nthreads or multiprocessing.cpu_count()
         self.reconnect = reconnect
         self.validate = validate
         self.resources = resources
@@ -120,7 +134,7 @@ class Nanny(ServerNode):
         self.quiet = quiet
         self.auto_restart = True
 
-        self.memory_limit = parse_memory_limit(memory_limit, self.ncores)
+        self.memory_limit = parse_memory_limit(memory_limit, self.nthreads)
 
         if silence_logs:
             silence_logging(level=silence_logs)
@@ -160,7 +174,7 @@ class Nanny(ServerNode):
         self.status = "init"
 
     def __repr__(self):
-        return "<Nanny: %s, threads: %d>" % (self.worker_address, self.ncores)
+        return "<Nanny: %s, threads: %d>" % (self.worker_address, self.nthreads)
 
     @gen.coroutine
     def _unregister(self, timeout=10):
@@ -263,7 +277,7 @@ class Nanny(ServerNode):
         if self.process is None:
             worker_kwargs = dict(
                 scheduler_ip=self.scheduler_addr,
-                ncores=self.ncores,
+                nthreads=self.nthreads,
                 local_dir=self.local_dir,
                 services=self.services,
                 nanny=self.address,
@@ -298,7 +312,13 @@ class Nanny(ServerNode):
                 )
             except gen.TimeoutError:
                 yield self.close(timeout=self.death_timeout)
-                raise gen.Return("timed out")
+                logger.exception(
+                    "Timed out connecting Nanny '%s' to scheduler '%s'",
+                    self,
+                    self.scheduler_addr,
+                )
+                raise
+
         else:
             result = yield self.process.start()
         raise gen.Return(result)

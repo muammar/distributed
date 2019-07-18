@@ -36,6 +36,9 @@ except ImportError:
 
 import dask
 from dask import istask
+
+# provide format_bytes here for backwards compatibility
+from dask.utils import format_bytes  # noqa
 import toolz
 import tornado
 from tornado import gen
@@ -280,7 +283,7 @@ def Any(args, quiet_exceptions=()):
     raise gen.Return(results)
 
 
-def sync(loop, func, *args, **kwargs):
+def sync(loop, func, *args, callback_timeout=None, **kwargs):
     """
     Run coroutine in loop running in separate thread.
     """
@@ -296,8 +299,6 @@ def sync(loop, func, *args, **kwargs):
     except AttributeError:
         pass
 
-    timeout = kwargs.pop("callback_timeout", None)
-
     e = threading.Event()
     main_tid = get_thread_identity()
     result = [None]
@@ -311,8 +312,8 @@ def sync(loop, func, *args, **kwargs):
             yield gen.moment
             thread_state.asynchronous = True
             future = func(*args, **kwargs)
-            if timeout is not None:
-                future = gen.with_timeout(timedelta(seconds=timeout), future)
+            if callback_timeout is not None:
+                future = gen.with_timeout(timedelta(seconds=callback_timeout), future)
             result[0] = yield future
         except Exception as exc:
             error[0] = sys.exc_info()
@@ -321,9 +322,9 @@ def sync(loop, func, *args, **kwargs):
             e.set()
 
     loop.add_callback(f)
-    if timeout is not None:
-        if not e.wait(timeout):
-            raise gen.TimeoutError("timed out after %s s." % (timeout,))
+    if callback_timeout is not None:
+        if not e.wait(callback_timeout):
+            raise gen.TimeoutError("timed out after %s s." % (callback_timeout,))
     else:
         while not e.is_set():
             e.wait(10)
@@ -1112,35 +1113,6 @@ class itemgetter(object):
         return (itemgetter, (self.index,))
 
 
-def format_bytes(n):
-    """ Format bytes as text
-
-    >>> format_bytes(1)
-    '1 B'
-    >>> format_bytes(1234)
-    '1.23 kB'
-    >>> format_bytes(12345678)
-    '12.35 MB'
-    >>> format_bytes(1234567890)
-    '1.23 GB'
-    >>> format_bytes(1234567890000)
-    '1.23 TB'
-    >>> format_bytes(1234567890000000)
-    '1.23 PB'
-    """
-    if n > 1e15:
-        return "%0.2f PB" % (n / 1e15)
-    if n > 1e12:
-        return "%0.2f TB" % (n / 1e12)
-    if n > 1e9:
-        return "%0.2f GB" % (n / 1e9)
-    if n > 1e6:
-        return "%0.2f MB" % (n / 1e6)
-    if n > 1e3:
-        return "%0.2f kB" % (n / 1000)
-    return "%d B" % n
-
-
 byte_sizes = {
     "kB": 10 ** 3,
     "MB": 10 ** 6,
@@ -1378,8 +1350,7 @@ class DequeHandler(logging.Handler):
 
     _instances = weakref.WeakSet()
 
-    def __init__(self, *args, **kwargs):
-        n = kwargs.pop("n", 10000)
+    def __init__(self, *args, n=10000, **kwargs):
         self.deque = deque(maxlen=n)
         super(DequeHandler, self).__init__(*args, **kwargs)
         self._instances.add(self)
@@ -1509,3 +1480,12 @@ def typename(typ):
         return typ.__module__ + "." + typ.__name__
     except AttributeError:
         return str(typ)
+
+
+def format_dashboard_link(host, port):
+    template = dask.config.get("distributed.dashboard.link")
+    if dask.config.get("distributed.scheduler.dashboard.tls.cert"):
+        scheme = "https"
+    else:
+        scheme = "http"
+    return template.format(scheme=scheme, host=host, port=port, **os.environ)

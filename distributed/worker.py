@@ -5,6 +5,7 @@ from collections import defaultdict, deque
 from datetime import timedelta
 import heapq
 import logging
+import multiprocessing
 import os
 from pickle import PicklingError
 import random
@@ -18,6 +19,7 @@ import psutil
 import dask
 from dask.core import istask
 from dask.compatibility import apply
+from dask.utils import format_bytes
 
 try:
     from cytoolz import pluck, partial, merge, first
@@ -53,13 +55,11 @@ from .utils import (
     _maybe_complex,
     log_errors,
     ignoring,
-    mp_context,
     import_file,
     silence_logging,
     thread_state,
     json_load_robust,
     key_split,
-    format_bytes,
     PeriodicCallback,
     parse_bytes,
     parse_timedelta,
@@ -68,8 +68,6 @@ from .utils import (
 )
 from .utils_comm import pack_data, gather_from_workers
 from .utils_perf import ThrottledGC, enable_gc_diagnosis, disable_gc_diagnosis
-
-_ncores = mp_context.cpu_count()
 
 logger = logging.getLogger(__name__)
 
@@ -116,8 +114,8 @@ class Worker(ServerNode):
 
     These attributes don't change significantly during execution.
 
-    * **ncores:** ``int``:
-        Number of cores used by this worker process
+    * **nthreads:** ``int``:
+        Number of nthreads used by this worker process
     * **executor:** ``concurrent.futures.ThreadPoolExecutor``:
         Executor used to perform computation
     * **local_dir:** ``path``:
@@ -233,7 +231,7 @@ class Worker(ServerNode):
     ip: str, optional
     data: MutableMapping, type, None
         The object to use for storage, builds a disk-backed LRU dict by default
-    ncores: int, optional
+    nthreads: int, optional
     loop: tornado.ioloop.IOLoop
     local_dir: str, optional
         Directory where we place local resources
@@ -241,7 +239,7 @@ class Worker(ServerNode):
     memory_limit: int, float, string
         Number of bytes of memory that this worker should use.
         Set to zero for no limit.  Set to 'auto' to calculate
-        as TOTAL_MEMORY * min(1, ncores / total_cores)
+        as TOTAL_MEMORY * min(1, nthreads / total_cores)
         Use strings or numbers like 5GB or 5e9
     memory_target_fraction: float
         Fraction of memory to try to stay beneath
@@ -281,6 +279,7 @@ class Worker(ServerNode):
         scheduler_port=None,
         scheduler_file=None,
         ncores=None,
+        nthreads=None,
         loop=None,
         local_dir=None,
         services=None,
@@ -309,6 +308,8 @@ class Worker(ServerNode):
         nanny=None,
         plugins=(),
         low_level_profiler=dask.config.get("distributed.worker.profile.low-level"),
+        validate=False,
+        profile_cycle_interval=None,
         **kwargs
     ):
         self.tasks = dict()
@@ -370,7 +371,7 @@ class Worker(ServerNode):
         self.target_message_size = 50e6  # 50 MB
 
         self.log = deque(maxlen=100000)
-        self.validate = kwargs.pop("validate", False)
+        self.validate = validate
 
         self._transitions = {
             ("waiting", "ready"): self.transition_waiting_ready,
@@ -405,10 +406,8 @@ class Worker(ServerNode):
         self.latency = 0.001
         self._client = None
 
-        profile_cycle_interval = kwargs.pop(
-            "profile_cycle_interval",
-            dask.config.get("distributed.worker.profile.cycle"),
-        )
+        if profile_cycle_interval is None:
+            profile_cycle_interval = dask.config.get("distributed.worker.profile.cycle")
         profile_cycle_interval = parse_timedelta(profile_cycle_interval, default="ms")
 
         self._setup_logging(logger)
@@ -432,7 +431,11 @@ class Worker(ServerNode):
             security=security,
         )
 
-        self.ncores = ncores or _ncores
+        if ncores is not None:
+            warnings.warn("the ncores= parameter has moved to nthreads=")
+            nthreads = ncores
+
+        self.nthreads = nthreads or multiprocessing.cpu_count()
         self.total_resources = resources or {}
         self.available_resources = (resources or {}).copy()
         self.death_timeout = parse_timedelta(death_timeout)
@@ -471,7 +474,7 @@ class Worker(ServerNode):
         self.connection_args = self.security.get_connection_args("worker")
         self.listen_args = self.security.get_listen_args("worker")
 
-        self.memory_limit = parse_memory_limit(memory_limit, self.ncores)
+        self.memory_limit = parse_memory_limit(memory_limit, self.nthreads)
 
         self.paused = False
 
@@ -526,7 +529,7 @@ class Worker(ServerNode):
         self._closed = Event()
         self.reconnect = reconnect
         self.executor = executor or ThreadPoolExecutor(
-            self.ncores, thread_name_prefix="Dask-Worker-Threads'"
+            self.nthreads, thread_name_prefix="Dask-Worker-Threads'"
         )
         self.actor_executor = ThreadPoolExecutor(
             1, thread_name_prefix="Dask-Actor-Threads"
@@ -658,7 +661,7 @@ class Worker(ServerNode):
                 self.status,
                 len(self.data),
                 len(self.executing),
-                self.ncores,
+                self.nthreads,
                 len(self.ready),
                 len(self.in_flight_tasks),
                 len(self.waiting_for_data),
@@ -687,7 +690,8 @@ class Worker(ServerNode):
             "type": type(self).__name__,
             "id": self.id,
             "scheduler": self.scheduler.address,
-            "ncores": self.ncores,
+            "nthreads": self.nthreads,
+            "ncores": self.nthreads,  # backwards compatibility
             "memory_limit": self.memory_limit,
         }
 
@@ -704,8 +708,14 @@ class Worker(ServerNode):
         logger.info("-" * 49)
         while True:
             if self.death_timeout and time() > start + self.death_timeout:
+                logger.exception(
+                    "Timed out when connecting to scheduler '%s'",
+                    self.scheduler.address,
+                )
                 yield self.close(timeout=1)
-                return
+                raise gen.TimeoutError(
+                    "Timed out connecting to scheduler '%s'" % self.scheduler.address
+                )
             if self.status in ("closed", "closing"):
                 raise gen.Return
             try:
@@ -722,7 +732,7 @@ class Worker(ServerNode):
                         reply=False,
                         address=self.contact_address,
                         keys=list(self.data),
-                        ncores=self.ncores,
+                        nthreads=self.nthreads,
                         name=self.name,
                         nbytes=self.nbytes,
                         types=types,
@@ -941,7 +951,7 @@ class Worker(ServerNode):
             logger.info("  %16s at: %26s" % (k, listen_host + ":" + str(v)))
         logger.info("Waiting to connect to: %26s", self.scheduler.address)
         logger.info("-" * 49)
-        logger.info("              Threads: %26d", self.ncores)
+        logger.info("              Threads: %26d", self.nthreads)
         if self.memory_limit:
             logger.info("               Memory: %26s", format_bytes(self.memory_limit))
         logger.info("      Local Directory: %26s", self.local_dir)
@@ -1874,11 +1884,6 @@ class Worker(ServerNode):
                 self.incoming_count += 1
 
                 self.log.append(("receive-dep", worker, list(response["data"])))
-
-                if response["data"]:
-                    self.batched_stream.send(
-                        {"op": "add-keys", "keys": list(response["data"])}
-                    )
             except EnvironmentError as e:
                 logger.exception("Worker stream died during communication: %s", worker)
                 self.log.append(("receive-dep-failed", worker))
@@ -2283,7 +2288,7 @@ class Worker(ServerNode):
         if self.paused:
             return
         try:
-            while self.constrained and len(self.executing) < self.ncores:
+            while self.constrained and len(self.executing) < self.nthreads:
                 key = self.constrained[0]
                 if self.task_state.get(key) != "constrained":
                     self.constrained.popleft()
@@ -2293,7 +2298,7 @@ class Worker(ServerNode):
                     self.transition(key, "executing")
                 else:
                     break
-            while self.ready and len(self.executing) < self.ncores:
+            while self.ready and len(self.executing) < self.nthreads:
                 _, key = heapq.heappop(self.ready)
                 if self.task_state.get(key) in READY:
                     self.transition(key, "executing")
@@ -2446,7 +2451,9 @@ class Worker(ServerNode):
                     "Process memory: %s -- Worker memory limit: %s",
                     int(frac * 100),
                     format_bytes(proc.memory_info().rss),
-                    format_bytes(self.memory_limit),
+                    format_bytes(self.memory_limit)
+                    if self.memory_limit is not None
+                    else "None",
                 )
                 self.paused = True
         elif self.paused:
@@ -2455,7 +2462,9 @@ class Worker(ServerNode):
                 "Process memory: %s -- Worker memory limit: %s",
                 int(frac * 100),
                 format_bytes(proc.memory_info().rss),
-                format_bytes(self.memory_limit),
+                format_bytes(self.memory_limit)
+                if self.memory_limit is not None
+                else "None",
             )
             self.paused = False
             self.ensure_computing()
@@ -2473,7 +2482,9 @@ class Worker(ServerNode):
                         "is leaking memory?  Process memory: %s -- "
                         "Worker memory limit: %s",
                         format_bytes(proc.memory_info().rss),
-                        format_bytes(self.memory_limit),
+                        format_bytes(self.memory_limit)
+                        if self.memory_limit is not None
+                        else "None",
                     )
                     break
                 k, v, weight = self.data.fast.evict()
@@ -2841,7 +2852,7 @@ def get_worker():
         return thread_state.execution_state["worker"]
     except AttributeError:
         try:
-            return first(Worker._instances)
+            return first(w for w in Worker._instances if w.status == "running")
         except StopIteration:
             raise ValueError("No workers found")
 
@@ -2955,12 +2966,12 @@ class Reschedule(Exception):
     pass
 
 
-def parse_memory_limit(memory_limit, ncores, total_cores=_ncores):
+def parse_memory_limit(memory_limit, nthreads, total_cores=multiprocessing.cpu_count()):
     if memory_limit is None:
         return None
 
     if memory_limit == "auto":
-        memory_limit = int(TOTAL_MEMORY * min(1, ncores / total_cores))
+        memory_limit = int(TOTAL_MEMORY * min(1, nthreads / total_cores))
     with ignoring(ValueError, TypeError):
         memory_limit = float(memory_limit)
         if isinstance(memory_limit, float) and memory_limit <= 1:

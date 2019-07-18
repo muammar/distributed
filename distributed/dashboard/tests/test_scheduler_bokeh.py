@@ -2,6 +2,7 @@ from __future__ import print_function, division, absolute_import
 
 import json
 import re
+import ssl
 import sys
 from time import sleep
 
@@ -10,13 +11,13 @@ import pytest
 pytest.importorskip("bokeh")
 from toolz import first
 from tornado import gen
-from tornado.httpclient import AsyncHTTPClient
+from tornado.httpclient import AsyncHTTPClient, HTTPRequest
 
 from dask.core import flatten
-from distributed.utils import tokey
+from distributed.utils import tokey, format_dashboard_link
 from distributed.client import wait
 from distributed.metrics import time
-from distributed.utils_test import gen_cluster, inc, dec, slowinc, div
+from distributed.utils_test import gen_cluster, inc, dec, slowinc, div, get_cert
 from distributed.dashboard.worker import Counters, BokehWorker
 from distributed.dashboard.scheduler import (
     BokehScheduler,
@@ -321,8 +322,8 @@ def test_WorkerTable(c, s, a, b):
     assert all(wt.source.data.values())
     assert all(len(v) == 2 for v in wt.source.data.values())
 
-    ncores = wt.source.data["ncores"]
-    assert all(ncores)
+    nthreads = wt.source.data["nthreads"]
+    assert all(nthreads)
 
 
 @gen_cluster(client=True)
@@ -627,3 +628,76 @@ def test_proxy_to_workers(c, s, a, b):
             assert b"pip install jupyter-server-proxy" in response_proxy.body
         assert response_direct.code == 200
         assert b"Crossfilter" in response_direct.body
+
+
+@gen_cluster(
+    client=True,
+    scheduler_kwargs={"services": {("dashboard", 0): BokehScheduler}},
+    config={
+        "distributed.scheduler.dashboard.tasks.task-stream-length": 10,
+        "distributed.scheduler.dashboard.status.task-stream-length": 10,
+    },
+)
+async def test_lots_of_tasks(c, s, a, b):
+    import toolz
+
+    ts = TaskStream(s)
+    ts.update()
+    futures = c.map(toolz.identity, range(100))
+    await wait(futures)
+
+    tsp = [p for p in s.plugins if "taskstream" in type(p).__name__.lower()][0]
+    assert len(tsp.buffer) == 10
+    ts.update()
+    assert len(ts.source.data["start"]) == 10
+    assert "identity" in str(ts.source.data)
+
+    futures = c.map(lambda x: x, range(100), pure=False)
+    await wait(futures)
+    ts.update()
+    assert "lambda" in str(ts.source.data)
+
+
+@gen_cluster(
+    client=True,
+    scheduler_kwargs={"services": {("dashboard", 0): BokehScheduler}},
+    config={
+        "distributed.scheduler.dashboard.tls.key": get_cert("tls-key.pem"),
+        "distributed.scheduler.dashboard.tls.cert": get_cert("tls-cert.pem"),
+        "distributed.scheduler.dashboard.tls.ca-file": get_cert("tls-ca-cert.pem"),
+    },
+)
+def test_https_support(c, s, a, b):
+    assert isinstance(s.services["dashboard"], BokehScheduler)
+    port = s.services["dashboard"].port
+
+    assert (
+        format_dashboard_link("localhost", port) == "https://localhost:%d/status" % port
+    )
+
+    ctx = ssl.create_default_context()
+    ctx.load_verify_locations(get_cert("tls-ca-cert.pem"))
+
+    http_client = AsyncHTTPClient()
+    for suffix in [
+        "system",
+        "counters",
+        "workers",
+        "status",
+        "tasks",
+        "stealing",
+        "graph",
+        "individual-task-stream",
+        "individual-progress",
+        "individual-graph",
+        "individual-nbytes",
+        "individual-nprocessing",
+        "individual-profile",
+    ]:
+        req = HTTPRequest(
+            url="https://localhost:%d/%s" % (port, suffix), ssl_options=ctx
+        )
+        response = yield http_client.fetch(req)
+        body = response.body.decode()
+        assert "bokeh" in body.lower()
+        assert not re.search("href=./", body)  # no absolute links

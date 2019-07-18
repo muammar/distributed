@@ -1,10 +1,11 @@
 from datetime import datetime
 
+from dask.utils import format_bytes
 import toolz
 from tornado import escape
 from tornado import gen
 
-from ..utils import log_errors, format_bytes, format_time
+from ..utils import log_errors, format_time
 from .proxy import GlobalProxyHandler
 from .utils import RequestHandler, redirect
 
@@ -107,7 +108,7 @@ class CountsJSON(RequestHandler):
         scheduler = self.server
         erred = 0
         nbytes = 0
-        ncores = 0
+        nthreads = 0
         memory = 0
         processing = 0
         released = 0
@@ -124,7 +125,7 @@ class CountsJSON(RequestHandler):
             if ts.waiters:
                 waiting_data += 1
         for ws in scheduler.workers.values():
-            ncores += ws.ncores
+            nthreads += ws.nthreads
             memory += len(ws.has_what)
             nbytes += ws.nbytes
             processing += len(ws.processing)
@@ -132,7 +133,7 @@ class CountsJSON(RequestHandler):
         response = {
             "bytes": nbytes,
             "clients": len(scheduler.clients),
-            "cores": ncores,
+            "cores": nthreads,
             "erred": erred,
             "hosts": len(scheduler.host_info),
             "idle": len(scheduler.idle),
@@ -183,13 +184,23 @@ class _PrometheusCollector(object):
 
         yield GaugeMetricFamily(
             "dask_scheduler_workers",
-            "Number of workers.",
+            "Number of workers connected.",
             value=len(self.server.workers),
         )
         yield GaugeMetricFamily(
             "dask_scheduler_clients",
-            "Number of clients.",
+            "Number of clients connected.",
             value=len(self.server.clients),
+        )
+        yield GaugeMetricFamily(
+            "dask_scheduler_received_tasks",
+            "Number of tasks received at scheduler",
+            value=len(self.server.tasks),
+        )
+        yield GaugeMetricFamily(
+            "dask_scheduler_unrunnable_tasks",
+            "Number of unrunnable tasks at scheduler",
+            value=len(self.server.unrunnable),
         )
 
 

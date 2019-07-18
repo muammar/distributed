@@ -51,7 +51,7 @@ from distributed.client import (
     futures_of,
     temp_default_client,
 )
-from distributed.compatibility import PY3
+from distributed.compatibility import PY3, WINDOWS
 
 from distributed.metrics import time
 from distributed.scheduler import Scheduler, KilledWorker
@@ -197,18 +197,15 @@ def test_map_retries(c, s, a, b):
     x, y, z = c.map(*map_varying(args), retries=1, pure=False)
     assert (yield x) == 2
     assert (yield y) == 4
-    with pytest.raises(ZeroDivisionError) as exc_info:
+    with pytest.raises(ZeroDivisionError, match="eight"):
         yield z
-    exc_info.match("eight")
 
     x, y, z = c.map(*map_varying(args), retries=0, pure=False)
-    with pytest.raises(ZeroDivisionError) as exc_info:
+    with pytest.raises(ZeroDivisionError, match="one"):
         yield x
-    exc_info.match("one")
     assert (yield y) == 4
-    with pytest.raises(ZeroDivisionError) as exc_info:
+    with pytest.raises(ZeroDivisionError, match="seven"):
         yield z
-    exc_info.match("seven")
 
 
 @gen_cluster(client=True)
@@ -217,15 +214,13 @@ def test_compute_retries(c, s, a, b):
 
     # Sanity check for varying() use
     x = c.compute(delayed(varying(args))())
-    with pytest.raises(ZeroDivisionError) as exc_info:
+    with pytest.raises(ZeroDivisionError, match="one"):
         yield x
-    exc_info.match("one")
 
     # Same retries for all
     x = c.compute(delayed(varying(args))(), retries=1)
-    with pytest.raises(ZeroDivisionError) as exc_info:
+    with pytest.raises(ZeroDivisionError, match="two"):
         yield x
-    exc_info.match("two")
 
     x = c.compute(delayed(varying(args))(), retries=2)
     assert (yield x) == 3
@@ -244,16 +239,14 @@ def test_compute_retries(c, s, a, b):
     gc.collect()
 
     assert (yield x) == 30
-    with pytest.raises(ZeroDivisionError) as exc_info:
+    with pytest.raises(ZeroDivisionError, match="five"):
         yield y
-    exc_info.match("five")
 
     x, y, z = [delayed(varying(args))() for args in (xargs, yargs, zargs)]
     x, y, z = c.compute([x, y, z], retries={(y, z): 2})
 
-    with pytest.raises(ZeroDivisionError) as exc_info:
+    with pytest.raises(ZeroDivisionError, match="one"):
         yield x
-    exc_info.match("one")
     assert (yield y) == 70
     assert (yield z) == 80
 
@@ -276,15 +269,13 @@ def test_compute_persisted_retries(c, s, a, b):
     # Sanity check
     x = c.persist(delayed(varying(args))())
     fut = c.compute(x)
-    with pytest.raises(ZeroDivisionError) as exc_info:
+    with pytest.raises(ZeroDivisionError, match="one"):
         yield fut
-    exc_info.match("one")
 
     x = c.persist(delayed(varying(args))())
     fut = c.compute(x, retries=1)
-    with pytest.raises(ZeroDivisionError) as exc_info:
+    with pytest.raises(ZeroDivisionError, match="two"):
         yield fut
-    exc_info.match("two")
 
     x = c.persist(delayed(varying(args))())
     fut = c.compute(x, retries=2)
@@ -303,9 +294,8 @@ def test_persist_retries(c, s, a, b):
 
     x = c.persist(delayed(varying(args))(), retries=1)
     x = c.compute(x)
-    with pytest.raises(ZeroDivisionError) as exc_info:
+    with pytest.raises(ZeroDivisionError, match="two"):
         yield x
-    exc_info.match("two")
 
     x = c.persist(delayed(varying(args))(), retries=2)
     x = c.compute(x)
@@ -320,9 +310,8 @@ def test_persist_retries(c, s, a, b):
     x, y, z = c.persist([x, y, z], retries={(y, z): 2})
     x, y, z = c.compute([x, y, z])
 
-    with pytest.raises(ZeroDivisionError) as exc_info:
+    with pytest.raises(ZeroDivisionError, match="one"):
         yield x
-    exc_info.match("one")
     assert (yield y) == 70
     assert (yield z) == 80
 
@@ -558,7 +547,7 @@ def test_gather_strict(c, s, a, b):
     assert xx == 2
 
 
-@gen_cluster(client=True, ncores=[("127.0.0.1", 1)])
+@gen_cluster(client=True, nthreads=[("127.0.0.1", 1)])
 def test_gather_skip(c, s, a):
     x = c.submit(div, 1, 0, priority=10)
     y = c.submit(slowinc, 1, delay=0.5)
@@ -953,7 +942,7 @@ def test_remove_worker(c, s, a, b):
     assert result == list(map(inc, range(20)))
 
 
-@gen_cluster(ncores=[("127.0.0.1", 1)], client=True)
+@gen_cluster(nthreads=[("127.0.0.1", 1)], client=True)
 def test_errors_dont_block(c, s, w):
     L = [c.submit(inc, 1), c.submit(throws, 1), c.submit(inc, 2), c.submit(throws, 2)]
 
@@ -1359,13 +1348,13 @@ def test_scatter_direct_broadcast(c, s, a, b):
     assert not s.counters["op"].components[0]["scatter"]
 
 
-@gen_cluster(client=True, ncores=[("127.0.0.1", 1)] * 4)
+@gen_cluster(client=True, nthreads=[("127.0.0.1", 1)] * 4)
 def test_scatter_direct_balanced(c, s, *workers):
     futures = yield c.scatter([1, 2, 3], direct=True)
     assert sorted([len(w.data) for w in workers]) == [0, 1, 1, 1]
 
 
-@gen_cluster(client=True, ncores=[("127.0.0.1", 1)] * 4)
+@gen_cluster(client=True, nthreads=[("127.0.0.1", 1)] * 4)
 def test_scatter_direct_broadcast_target(c, s, *workers):
     futures = yield c.scatter([123, 456], direct=True, workers=workers[0].address)
     assert futures[0].key in workers[0].data
@@ -1384,13 +1373,13 @@ def test_scatter_direct_broadcast_target(c, s, *workers):
     )
 
 
-@gen_cluster(client=True, ncores=[])
+@gen_cluster(client=True, nthreads=[])
 def test_scatter_direct_empty(c, s):
     with pytest.raises((ValueError, gen.TimeoutError)):
         yield c.scatter(123, direct=True, timeout=0.1)
 
 
-@gen_cluster(client=True, timeout=None, ncores=[("127.0.0.1", 1)] * 5)
+@gen_cluster(client=True, timeout=None, nthreads=[("127.0.0.1", 1)] * 5)
 def test_scatter_direct_spread_evenly(c, s, *workers):
     futures = []
     for i in range(10):
@@ -1724,7 +1713,7 @@ def test_start_is_idempotent(c):
 
 @gen_cluster(client=True)
 def test_client_with_scheduler(c, s, a, b):
-    assert s.ncores == {a.address: a.ncores, b.address: b.ncores}
+    assert s.nthreads == {a.address: a.nthreads, b.address: b.nthreads}
 
     x = c.submit(inc, 1)
     y = c.submit(inc, 2)
@@ -1900,6 +1889,11 @@ def test_repr(loop):
 
 @gen_cluster(client=True)
 def test_repr_async(c, s, a, b):
+    c._repr_html_()
+
+
+@gen_cluster(client=True, worker_kwargs={"memory_limit": None})
+def test_repr_no_memory_limit(c, s, a, b):
     c._repr_html_()
 
 
@@ -2171,7 +2165,7 @@ def test__broadcast(c, s, a, b):
     assert a.data == b.data == {x.key: 1, y.key: 2}
 
 
-@gen_cluster(client=True, ncores=[("127.0.0.1", 1)] * 4)
+@gen_cluster(client=True, nthreads=[("127.0.0.1", 1)] * 4)
 def test__broadcast_integer(c, s, *workers):
     x, y = yield c.scatter([1, 2], broadcast=2)
     assert len(s.tasks[x.key].who_has) == 2
@@ -2486,7 +2480,7 @@ def test_futures_of_cancelled_raises(c, s, a, b):
 
 
 @pytest.mark.skip
-@gen_cluster(ncores=[("127.0.0.1", 1)], client=True)
+@gen_cluster(nthreads=[("127.0.0.1", 1)], client=True)
 def test_dont_delete_recomputed_results(c, s, w):
     x = c.submit(inc, 1)  # compute first time
     yield wait([x])
@@ -2504,7 +2498,7 @@ def test_dont_delete_recomputed_results(c, s, w):
         yield gen.sleep(0.01)
 
 
-@gen_cluster(ncores=[], client=True)
+@gen_cluster(nthreads=[], client=True)
 def test_fatally_serialized_input(c, s):
     o = FatallySerializedObject()
 
@@ -2575,9 +2569,8 @@ def test_run_coroutine(c, s, a, b):
     results = yield c.run(geninc, 1, workers=[])
     assert results == {}
 
-    with pytest.raises(RuntimeError) as exc_info:
+    with pytest.raises(RuntimeError, match="hello"):
         yield c.run(throws, 1)
-    assert "hello" in str(exc_info)
 
     if sys.version_info >= (3, 5):
         results = yield c.run(asyncinc, 2, delay=0.01)
@@ -2603,9 +2596,8 @@ def test_run_exception(c):
         raise exc_type(exc_msg)
 
     for exc_type in [ValueError, RuntimeError]:
-        with pytest.raises(exc_type) as excinfo:
+        with pytest.raises(exc_type, match="informative message"):
             c.run(raise_exception, exc_type, "informative message")
-        assert "informative message" in str(excinfo.value)
 
 
 def test_diagnostic_ui(loop):
@@ -2613,14 +2605,14 @@ def test_diagnostic_ui(loop):
         a_addr = a["address"]
         b_addr = b["address"]
         with Client(s["address"], loop=loop) as c:
-            d = c.ncores()
+            d = c.nthreads()
             assert d == {a_addr: 1, b_addr: 1}
 
-            d = c.ncores([a_addr])
+            d = c.nthreads([a_addr])
             assert d == {a_addr: 1}
-            d = c.ncores(a_addr)
+            d = c.nthreads(a_addr)
             assert d == {a_addr: 1}
-            d = c.ncores(a["address"])
+            d = c.nthreads(a["address"])
             assert d == {a_addr: 1}
 
             x = c.submit(inc, 1)
@@ -2732,9 +2724,7 @@ def test_persist_get(c, s, a, b):
     assert result == ((1 + 1) + (2 + 2)) + 10
 
 
-@pytest.mark.skipif(
-    sys.platform.startswith("win"), reason="num_fds not supported on windows"
-)
+@pytest.mark.skipif(WINDOWS, reason="num_fds not supported on windows")
 def test_client_num_fds(loop):
     psutil = pytest.importorskip("psutil")
     with cluster() as (s, [a, b]):
@@ -2813,7 +2803,7 @@ def test_rebalance(c, s, a, b):
     assert aws not in s.tasks[x.key].who_has or aws not in s.tasks[y.key].who_has
 
 
-@gen_cluster(ncores=[("127.0.0.1", 1)] * 4, client=True)
+@gen_cluster(nthreads=[("127.0.0.1", 1)] * 4, client=True)
 def test_rebalance_workers(e, s, a, b, c, d):
     w, x, y, z = yield e.scatter([1, 2, 3, 4], workers=[a.address])
     assert len(a.data) == 4
@@ -2903,11 +2893,11 @@ def test_unrunnable_task_runs(c, s, a, b):
     yield w.close()
 
 
-@gen_cluster(client=True, ncores=[])
+@gen_cluster(client=True, nthreads=[])
 def test_add_worker_after_tasks(c, s):
     futures = c.map(inc, range(10))
 
-    n = yield Nanny(s.address, ncores=2, loop=s.loop, port=0)
+    n = yield Nanny(s.address, nthreads=2, loop=s.loop, port=0)
 
     result = yield c.gather(futures)
 
@@ -2939,7 +2929,7 @@ def test_submit_on_cancelled_future(c, s, a, b):
         y = c.submit(inc, x)
 
 
-@gen_cluster(client=True, ncores=[("127.0.0.1", 1)] * 10)
+@gen_cluster(client=True, nthreads=[("127.0.0.1", 1)] * 10)
 def test_replicate(c, s, *workers):
     [a, b] = yield c.scatter([1, 2])
     yield s.replicate(keys=[a.key, b.key], n=5)
@@ -2964,7 +2954,7 @@ def test_replicate_tuple_keys(c, s, a, b):
     s.validate_state()
 
 
-@gen_cluster(client=True, ncores=[("127.0.0.1", 1)] * 10)
+@gen_cluster(client=True, nthreads=[("127.0.0.1", 1)] * 10)
 def test_replicate_workers(c, s, *workers):
 
     [a, b] = yield c.scatter([1, 2], workers=[workers[0].address])
@@ -3015,7 +3005,7 @@ class CountSerialization(object):
         return self.n
 
 
-@gen_cluster(client=True, ncores=[("127.0.0.1", 1)] * 10)
+@gen_cluster(client=True, nthreads=[("127.0.0.1", 1)] * 10)
 def test_replicate_tree_branching(c, s, *workers):
     obj = CountSerialization()
     [future] = yield c.scatter([obj])
@@ -3025,7 +3015,7 @@ def test_replicate_tree_branching(c, s, *workers):
     assert max_count > 1
 
 
-@gen_cluster(client=True, ncores=[("127.0.0.1", 1)] * 10)
+@gen_cluster(client=True, nthreads=[("127.0.0.1", 1)] * 10)
 def test_client_replicate(c, s, *workers):
     x = c.submit(inc, 1)
     y = c.submit(inc, 2)
@@ -3051,7 +3041,7 @@ def test_client_replicate(c, s, *workers):
 )
 @gen_cluster(
     client=True,
-    ncores=[("127.0.0.1", 1), ("127.0.0.2", 1), ("127.0.0.2", 1)],
+    nthreads=[("127.0.0.1", 1), ("127.0.0.2", 1), ("127.0.0.2", 1)],
     timeout=None,
 )
 def test_client_replicate_host(client, s, a, b, c):
@@ -3084,10 +3074,8 @@ def test_client_replicate_sync(c):
     assert y.result() == 3
 
 
-@pytest.mark.skipif(
-    sys.platform.startswith("win"), reason="Windows timer too coarse-grained"
-)
-@gen_cluster(client=True, ncores=[("127.0.0.1", 4)] * 1)
+@pytest.mark.skipif(WINDOWS, reason="Windows timer too coarse-grained")
+@gen_cluster(client=True, nthreads=[("127.0.0.1", 4)] * 1)
 def test_task_load_adapts_quickly(c, s, a):
     future = c.submit(slowinc, 1, delay=0.2)  # slow
     yield wait(future)
@@ -3099,7 +3087,7 @@ def test_task_load_adapts_quickly(c, s, a):
     assert 0 < s.task_duration["slowinc"] < 0.1
 
 
-@gen_cluster(client=True, ncores=[("127.0.0.1", 1)] * 2)
+@gen_cluster(client=True, nthreads=[("127.0.0.1", 1)] * 2)
 def test_even_load_after_fast_functions(c, s, a, b):
     x = c.submit(inc, 1, workers=a.address)  # very fast
     y = c.submit(inc, 2, workers=b.address)  # very fast
@@ -3113,7 +3101,7 @@ def test_even_load_after_fast_functions(c, s, a, b):
     # assert abs(len(a.data) - len(b.data)) <= 3
 
 
-@gen_cluster(client=True, ncores=[("127.0.0.1", 1)] * 2)
+@gen_cluster(client=True, nthreads=[("127.0.0.1", 1)] * 2)
 def test_even_load_on_startup(c, s, a, b):
     x, y = c.map(inc, [1, 2])
     yield wait([x, y])
@@ -3121,7 +3109,7 @@ def test_even_load_on_startup(c, s, a, b):
 
 
 @pytest.mark.skip
-@gen_cluster(client=True, ncores=[("127.0.0.1", 2)] * 2)
+@gen_cluster(client=True, nthreads=[("127.0.0.1", 2)] * 2)
 def test_contiguous_load(c, s, a, b):
     w, x, y, z = c.map(inc, [1, 2, 3, 4])
     yield wait([w, x, y, z])
@@ -3131,7 +3119,7 @@ def test_contiguous_load(c, s, a, b):
     assert {y.key, z.key} in groups
 
 
-@gen_cluster(client=True, ncores=[("127.0.0.1", 1)] * 4)
+@gen_cluster(client=True, nthreads=[("127.0.0.1", 1)] * 4)
 def test_balanced_with_submit(c, s, *workers):
     L = [c.submit(slowinc, i) for i in range(4)]
     yield wait(L)
@@ -3139,7 +3127,7 @@ def test_balanced_with_submit(c, s, *workers):
         assert len(w.data) == 1
 
 
-@gen_cluster(client=True, ncores=[("127.0.0.1", 1)] * 4)
+@gen_cluster(client=True, nthreads=[("127.0.0.1", 1)] * 4)
 def test_balanced_with_submit_and_resident_data(c, s, *workers):
     [x] = yield c.scatter([10], broadcast=True)
     L = [c.submit(slowinc, x, pure=False) for i in range(4)]
@@ -3148,7 +3136,7 @@ def test_balanced_with_submit_and_resident_data(c, s, *workers):
         assert len(w.data) == 2
 
 
-@gen_cluster(client=True, ncores=[("127.0.0.1", 20)] * 2)
+@gen_cluster(client=True, nthreads=[("127.0.0.1", 20)] * 2)
 def test_scheduler_saturates_cores(c, s, a, b):
     for delay in [0, 0.01, 0.1]:
         futures = c.map(slowinc, range(100), delay=delay)
@@ -3163,7 +3151,7 @@ def test_scheduler_saturates_cores(c, s, a, b):
             yield gen.sleep(0.01)
 
 
-@gen_cluster(client=True, ncores=[("127.0.0.1", 20)] * 2)
+@gen_cluster(client=True, nthreads=[("127.0.0.1", 20)] * 2)
 def test_scheduler_saturates_cores_random(c, s, a, b):
     for delay in [0, 0.01, 0.1]:
         futures = c.map(randominc, range(100), scale=0.1)
@@ -3177,7 +3165,7 @@ def test_scheduler_saturates_cores_random(c, s, a, b):
             yield gen.sleep(0.01)
 
 
-@gen_cluster(client=True, ncores=[("127.0.0.1", 1)] * 4)
+@gen_cluster(client=True, nthreads=[("127.0.0.1", 1)] * 4)
 def test_cancel_clears_processing(c, s, *workers):
     da = pytest.importorskip("dask.array")
     x = c.submit(slowinc, 1, delay=0.2)
@@ -3255,10 +3243,10 @@ def test_get_foo(c, s, a, b):
     yield wait(futures)
 
     x = yield c.scheduler.ncores()
-    assert x == s.ncores
+    assert x == s.nthreads
 
     x = yield c.scheduler.ncores(workers=[a.address])
-    assert x == {a.address: s.ncores[a.address]}
+    assert x == {a.address: s.nthreads[a.address]}
 
     x = yield c.scheduler.has_what()
     assert valmap(sorted, x) == valmap(sorted, s.has_what)
@@ -3287,7 +3275,7 @@ def assert_dict_key_equal(expected, actual):
         assert list(ev) == list(av)
 
 
-@gen_cluster(client=True, ncores=[("127.0.0.1", 1)] * 3)
+@gen_cluster(client=True, nthreads=[("127.0.0.1", 1)] * 3)
 def test_get_foo_lost_keys(c, s, u, v, w):
     x = c.submit(inc, 1, workers=[u.address])
     y = yield c.scatter(3, workers=[v.address])
@@ -3489,7 +3477,7 @@ def test_persist_optimize_graph(c, s, a, b):
         assert not any(tokey(k) in s.tasks for k in b2.__dask_keys__())
 
 
-@gen_cluster(client=True, ncores=[])
+@gen_cluster(client=True, nthreads=[])
 def test_scatter_raises_if_no_workers(c, s):
     with pytest.raises(gen.TimeoutError):
         yield c.scatter(1, timeout=0.5)
@@ -3511,7 +3499,7 @@ def test_reconnect(loop):
     with popen(scheduler_cli) as s:
         c = Client("127.0.0.1:9393", loop=loop)
         start = time()
-        while len(c.ncores()) != 1:
+        while len(c.nthreads()) != 1:
             sleep(0.1)
             assert time() < start + 3
 
@@ -3524,7 +3512,7 @@ def test_reconnect(loop):
         sleep(0.01)
 
     with pytest.raises(Exception):
-        c.ncores()
+        c.nthreads()
 
     assert x.status == "cancelled"
     with pytest.raises(CancelledError):
@@ -3536,7 +3524,7 @@ def test_reconnect(loop):
             sleep(0.1)
             assert time() < start + 5
         start = time()
-        while len(c.ncores()) != 1:
+        while len(c.nthreads()) != 1:
             sleep(0.05)
             assert time() < start + 15
 
@@ -3559,7 +3547,7 @@ def test_reconnect(loop):
     c.close()
 
 
-@gen_cluster(client=True, ncores=[], client_kwargs={"timeout": 0.5})
+@gen_cluster(client=True, nthreads=[], client_kwargs={"timeout": 0.5})
 def test_reconnect_timeout(c, s):
     with captured_logger(logging.getLogger("distributed.client")) as logger:
         yield s.close()
@@ -3573,9 +3561,7 @@ def test_reconnect_timeout(c, s):
 
 
 @pytest.mark.slow
-@pytest.mark.skipif(
-    sys.platform.startswith("win"), reason="num_fds not supported on windows"
-)
+@pytest.mark.skipif(WINDOWS, reason="num_fds not supported on windows")
 @pytest.mark.skipif(
     sys.version_info[0] == 2, reason="Semaphore.acquire doesn't support timeout option"
 )
@@ -3626,7 +3612,7 @@ def test_open_close_many_workers(loop, worker, count, repeat):
                     break
 
             start = time()
-            while c.ncores():
+            while c.nthreads():
                 sleep(0.2)
                 assert time() < start + 10
 
@@ -3748,7 +3734,7 @@ def test_lose_scattered_data(c, s, a, b):
     assert x.key not in s.tasks
 
 
-@gen_cluster(client=True, ncores=[("127.0.0.1", 1)] * 3)
+@gen_cluster(client=True, nthreads=[("127.0.0.1", 1)] * 3)
 def test_partially_lose_scattered_data(e, s, a, b, c):
     x = yield e.scatter(1, workers=a.address)
     yield e.replicate(x, n=2)
@@ -3887,7 +3873,7 @@ def test_temp_client(s, a, b):
 
 
 @nodebug  # test timing is fragile
-@gen_cluster(ncores=[("127.0.0.1", 1)] * 3, client=True)
+@gen_cluster(nthreads=[("127.0.0.1", 1)] * 3, client=True)
 def test_persist_workers(e, s, a, b, c):
     L1 = [delayed(inc)(i) for i in range(4)]
     total = delayed(sum)(L1)
@@ -3912,7 +3898,7 @@ def test_persist_workers(e, s, a, b, c):
     assert s.loose_restrictions == {total2.key} | {v.key for v in L2}
 
 
-@gen_cluster(ncores=[("127.0.0.1", 1)] * 3, client=True)
+@gen_cluster(nthreads=[("127.0.0.1", 1)] * 3, client=True)
 def test_compute_workers(e, s, a, b, c):
     L1 = [delayed(inc)(i) for i in range(4)]
     total = delayed(sum)(L1)
@@ -3991,7 +3977,7 @@ def test_retire_workers_2(c, s, a, b):
     assert a.address not in s.workers
 
 
-@gen_cluster(client=True, ncores=[("127.0.0.1", 1)] * 10)
+@gen_cluster(client=True, nthreads=[("127.0.0.1", 1)] * 10)
 def test_retire_many_workers(c, s, *workers):
     futures = yield c.scatter(list(range(100)))
 
@@ -4000,14 +3986,14 @@ def test_retire_many_workers(c, s, *workers):
     results = yield c.gather(futures)
     assert results == list(range(100))
 
-    assert len(s.has_what) == len(s.ncores) == 3
+    assert len(s.has_what) == len(s.nthreads) == 3
     assert all(future.done() for future in futures)
     assert all(s.tasks[future.key].state == "memory" for future in futures)
     for w, keys in s.has_what.items():
         assert 15 < len(keys) < 50
 
 
-@gen_cluster(client=True, ncores=[("127.0.0.1", 3)] * 2)
+@gen_cluster(client=True, nthreads=[("127.0.0.1", 3)] * 2)
 def test_weight_occupancy_against_data_movement(c, s, a, b):
     s.extensions["stealing"]._pc.callback_time = 1000000
     s.task_duration["f"] = 0.01
@@ -4027,8 +4013,8 @@ def test_weight_occupancy_against_data_movement(c, s, a, b):
     assert sum(f.key in b.data for f in futures) >= 1
 
 
-@gen_cluster(client=True, ncores=[("127.0.0.1", 1), ("127.0.0.1", 10)])
-def test_distribute_tasks_by_ncores(c, s, a, b):
+@gen_cluster(client=True, nthreads=[("127.0.0.1", 1), ("127.0.0.1", 10)])
+def test_distribute_tasks_by_nthreads(c, s, a, b):
     s.task_duration["f"] = 0.01
     s.extensions["stealing"]._pc.callback_time = 1000000
 
@@ -4426,16 +4412,15 @@ def test_recreate_error_sync(c):
     tot = c.submit(sum, x, y)
     f = c.compute(tot)
 
-    with pytest.raises(ZeroDivisionError) as e:
+    with pytest.raises(ZeroDivisionError):
         c.recreate_error_locally(f)
     assert f.status == "error"
 
 
 def test_recreate_error_not_error(c):
     f = c.submit(dec, 2)
-    with pytest.raises(ValueError) as e:
+    with pytest.raises(ValueError, match="No errored futures passed"):
         c.recreate_error_locally(f)
-    assert "No errored futures passed" in str(e)
 
 
 @gen_cluster(client=True)
@@ -4503,7 +4488,7 @@ def test_robust_undeserializable_function(c, s, a, b):
             return 1
 
     future = c.submit(Foo(), 1)
-    with pytest.raises(MyException) as e:
+    with pytest.raises(MyException):
         yield future
 
     futures = c.map(inc, range(10))
@@ -4664,7 +4649,7 @@ def test_identity(c, s, a, b):
     assert s.id.lower().startswith("scheduler")
 
 
-@gen_cluster(client=True, ncores=[("127.0.0.1", 4)] * 2)
+@gen_cluster(client=True, nthreads=[("127.0.0.1", 4)] * 2)
 def test_get_client(c, s, a, b):
     assert get_client() is c
     assert c.asynchronous
@@ -4713,7 +4698,7 @@ def test_serialize_collections(c, s, a, b):
     assert result == sum(range(10))
 
 
-@gen_cluster(client=True, ncores=[("127.0.0.1", 1)] * 1, timeout=100)
+@gen_cluster(client=True, nthreads=[("127.0.0.1", 1)] * 1, timeout=100)
 def test_secede_simple(c, s, a):
     def f():
         client = get_client()
@@ -4725,7 +4710,7 @@ def test_secede_simple(c, s, a):
 
 
 @pytest.mark.slow
-@gen_cluster(client=True, ncores=[("127.0.0.1", 1)] * 2, timeout=60)
+@gen_cluster(client=True, nthreads=[("127.0.0.1", 1)] * 2, timeout=60)
 def test_secede_balances(c, s, a, b):
     count = threading.active_count()
 
@@ -5055,7 +5040,7 @@ def test_client_async_before_loop_starts():
     client=True,
     Worker=Nanny if PY3 else Worker,
     timeout=60,
-    ncores=[("127.0.0.1", 3)] * 2,
+    nthreads=[("127.0.0.1", 3)] * 2,
 )
 def test_nested_compute(c, s, a, b):
     def fib(x):
@@ -5220,7 +5205,7 @@ def test_client_doesnt_close_given_loop(loop, s, a, b):
         assert c.submit(inc, 2).result() == 3
 
 
-@gen_cluster(client=True, ncores=[])
+@gen_cluster(client=True, nthreads=[])
 def test_quiet_scheduler_loss(c, s):
     c._periodic_callbacks["scheduler-info"].interval = 10
     with captured_logger(logging.getLogger("distributed.client")) as logger:
@@ -5230,20 +5215,21 @@ def test_quiet_scheduler_loss(c, s):
     assert "BrokenPipeError" not in text
 
 
-@pytest.mark.skipif("USER" not in os.environ, reason="no USER env variable")
-def test_diagnostics_link_env_variable(loop):
+def test_dashboard_link(loop, monkeypatch):
     pytest.importorskip("bokeh")
     from distributed.dashboard import BokehScheduler
+
+    monkeypatch.setenv("USER", "myusername")
 
     with cluster(
         scheduler_kwargs={"services": {("dashboard", 12355): BokehScheduler}}
     ) as (s, [a, b]):
         with Client(s["address"], loop=loop) as c:
             with dask.config.set(
-                {"distributed.dashboard.link": "http://foo-{USER}:{port}/status"}
+                {"distributed.dashboard.link": "{scheme}://foo-{USER}:{port}/status"}
             ):
                 text = c._repr_html_()
-                link = "http://foo-" + os.environ["USER"] + ":12355/status"
+                link = "http://foo-myusername:12355/status"
                 assert link in text
 
 
@@ -5368,7 +5354,7 @@ def test_client_repr_closed_sync(loop):
         c._repr_html_()
 
 
-@gen_cluster(client=True, ncores=[("127.0.0.1", 1)])
+@gen_cluster(client=True, nthreads=[("127.0.0.1", 1)])
 def test_nested_prioritization(c, s, w):
     x = delayed(inc)(1, dask_key_name=("a", 2))
     y = delayed(inc)(2, dask_key_name=("a", 10))
@@ -5522,7 +5508,11 @@ def test_profile_bokeh(c, s, a, b):
     assert isinstance(figure, Model)
 
     with tmpfile("html") as fn:
-        yield c.profile(filename=fn)
+        try:
+            yield c.profile(filename=fn)
+        except PermissionError:
+            if WINDOWS:
+                pytest.xfail()
         assert os.path.exists(fn)
 
 

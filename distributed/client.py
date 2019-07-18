@@ -28,7 +28,7 @@ from dask.base import tokenize, normalize_token, collections_to_dsk
 from dask.core import flatten, get_dependencies
 from dask.optimization import SubgraphCallable
 from dask.compatibility import apply, unicode
-from dask.utils import ensure_dict
+from dask.utils import ensure_dict, format_bytes
 
 try:
     from cytoolz import first, groupby, merge, valmap, keymap
@@ -82,7 +82,6 @@ from .utils import (
     log_errors,
     str_graph,
     key_split,
-    format_bytes,
     asciitable,
     thread_state,
     no_default,
@@ -92,6 +91,7 @@ from .utils import (
     shutting_down,
     Any,
     has_keyword,
+    format_dashboard_link,
 )
 from .versions import get_versions
 
@@ -748,20 +748,20 @@ class Client(Node):
         """
         return self._asynchronous and self.loop is IOLoop.current()
 
-    def sync(self, func, *args, **kwargs):
-        asynchronous = kwargs.pop("asynchronous", None)
+    def sync(self, func, *args, asynchronous=None, callback_timeout=None, **kwargs):
         if (
             asynchronous
             or self.asynchronous
             or getattr(thread_state, "asynchronous", False)
         ):
-            callback_timeout = kwargs.pop("callback_timeout", None)
             future = func(*args, **kwargs)
             if callback_timeout is not None:
                 future = gen.with_timeout(timedelta(seconds=callback_timeout), future)
             return future
         else:
-            return sync(self.loop, func, *args, **kwargs)
+            return sync(
+                self.loop, func, *args, callback_timeout=callback_timeout, **kwargs
+            )
 
     def __repr__(self):
         # Note: avoid doing I/O here...
@@ -770,12 +770,12 @@ class Client(Node):
         if addr:
             workers = info.get("workers", {})
             nworkers = len(workers)
-            ncores = sum(w["ncores"] for w in workers.values())
+            nthreads = sum(w["nthreads"] for w in workers.values())
             return "<%s: scheduler=%r processes=%d cores=%d>" % (
                 self.__class__.__name__,
                 addr,
                 nworkers,
-                ncores,
+                nthreads,
             )
         elif self.scheduler is not None:
             return "<%s: scheduler=%r>" % (
@@ -801,7 +801,7 @@ class Client(Node):
             info = sync(self.loop, self.scheduler.identity)
             scheduler = self.scheduler
         else:
-            info = False
+            info = self._scheduler_identity
             scheduler = self.scheduler
 
         if scheduler is not None:
@@ -819,8 +819,7 @@ class Client(Node):
                 host = "localhost"
             else:
                 host = rest.split(":")[0]
-            template = dask.config.get("distributed.dashboard.link")
-            address = template.format(host=host, port=port, **os.environ)
+            address = format_dashboard_link(host, port)
             text += (
                 "  <li><b>Dashboard: </b><a href='%(web)s' target='_blank'>%(web)s</a>\n"
                 % {"web": address}
@@ -829,10 +828,14 @@ class Client(Node):
         text += "</ul>\n"
 
         if info:
-            workers = len(info["workers"])
-            cores = sum(w["ncores"] for w in info["workers"].values())
-            memory = sum(w["memory_limit"] for w in info["workers"].values())
-            memory = format_bytes(memory)
+            workers = list(info["workers"].values())
+            cores = sum(w["nthreads"] for w in workers)
+            if all(isinstance(w["memory_limit"], Number) for w in workers):
+                memory = sum(w["memory_limit"] for w in workers)
+                memory = format_bytes(memory)
+            else:
+                memory = ""
+
             text2 = (
                 "<h3>Cluster</h3>\n"
                 "<ul>\n"
@@ -840,7 +843,7 @@ class Client(Node):
                 "  <li><b>Cores: </b>%d</li>\n"
                 "  <li><b>Memory: </b>%s</li>\n"
                 "</ul>\n"
-            ) % (workers, cores, memory)
+            ) % (len(workers), cores, memory)
 
             return (
                 '<table style="border: 2px solid white;">\n'
@@ -1352,7 +1355,23 @@ class Client(Node):
         """
         return ClientExecutor(self, **kwargs)
 
-    def submit(self, func, *args, **kwargs):
+    def submit(
+        self,
+        func,
+        *args,
+        key=None,
+        workers=None,
+        resources=None,
+        retries=None,
+        priority=0,
+        fifo_timeout="100 ms",
+        allow_other_workers=False,
+        actor=False,
+        actors=False,
+        pure=None,
+        **kwargs
+    ):
+
         """ Submit a function application to the scheduler
 
         Parameters
@@ -1394,15 +1413,9 @@ class Client(Node):
         if not callable(func):
             raise TypeError("First input to submit must be a callable function")
 
-        key = kwargs.pop("key", None)
-        workers = kwargs.pop("workers", None)
-        resources = kwargs.pop("resources", None)
-        retries = kwargs.pop("retries", None)
-        priority = kwargs.pop("priority", 0)
-        fifo_timeout = kwargs.pop("fifo_timeout", "100ms")
-        allow_other_workers = kwargs.pop("allow_other_workers", False)
-        actor = kwargs.pop("actor", kwargs.pop("actors", False))
-        pure = kwargs.pop("pure", not actor)
+        actor = actor or actors
+        if pure is None:
+            pure = not actor
 
         if allow_other_workers not in (True, False, None):
             raise TypeError("allow_other_workers= must be True or False")
@@ -1453,7 +1466,22 @@ class Client(Node):
 
         return futures[skey]
 
-    def map(self, func, *iterables, **kwargs):
+    def map(
+        self,
+        func,
+        *iterables,
+        key=None,
+        workers=None,
+        retries=None,
+        resources=None,
+        priority=0,
+        allow_other_workers=False,
+        fifo_timeout="100 ms",
+        actor=False,
+        actors=False,
+        pure=None,
+        **kwargs
+    ):
         """ Map a function on a sequence of arguments
 
         Arguments can be normal objects or Futures
@@ -1495,6 +1523,11 @@ class Client(Node):
         --------
         Client.submit: Submit a single function
         """
+        key = key or funcname(func)
+        actor = actor or actors
+        if pure is None:
+            pure = not actor
+
         if not callable(func):
             raise TypeError("First input to map must be a callable function")
 
@@ -1505,17 +1538,6 @@ class Client(Node):
                 "Dask no longer supports mapping over Iterators or Queues."
                 "Consider using a normal for loop and Client.submit"
             )
-
-        key = kwargs.pop("key", None)
-        key = key or funcname(func)
-        workers = kwargs.pop("workers", None)
-        retries = kwargs.pop("retries", None)
-        resources = kwargs.pop("resources", None)
-        user_priority = kwargs.pop("priority", 0)
-        allow_other_workers = kwargs.pop("allow_other_workers", False)
-        fifo_timeout = kwargs.pop("fifo_timeout", "100ms")
-        actor = kwargs.pop("actor", kwargs.pop("actors", False))
-        pure = kwargs.pop("pure", not actor)
 
         if allow_other_workers and workers is None:
             raise ValueError("Only use allow_other_workers= if using workers=")
@@ -1582,7 +1604,7 @@ class Client(Node):
         else:
             loose_restrictions = set()
 
-        priority = dict(zip(keys, range(len(keys))))
+        internal_priority = dict(zip(keys, range(len(keys))))
 
         if resources:
             resources = {k: resources for k in keys}
@@ -1594,10 +1616,10 @@ class Client(Node):
             keys,
             restrictions,
             loose_restrictions,
-            priority=priority,
+            priority=internal_priority,
             resources=resources,
             retries=retries,
-            user_priority=user_priority,
+            user_priority=priority,
             fifo_timeout=fifo_timeout,
             actors=actor,
         )
@@ -1868,19 +1890,19 @@ class Client(Node):
         else:
             data2 = valmap(to_serialize, data)
             if direct:
-                ncores = None
+                nthreads = None
                 start = time()
-                while not ncores:
-                    if ncores is not None:
+                while not nthreads:
+                    if nthreads is not None:
                         yield gen.sleep(0.1)
                     if time() > start + timeout:
                         raise gen.TimeoutError("No valid workers found")
-                    ncores = yield self.scheduler.ncores(workers=workers)
-                if not ncores:
+                    nthreads = yield self.scheduler.ncores(workers=workers)
+                if not nthreads:
                     raise ValueError("No valid workers")
 
                 _, who_has, nbytes = yield scatter_to_workers(
-                    ncores, data2, report=False, rpc=self.rpc
+                    nthreads, data2, report=False, rpc=self.rpc
                 )
 
                 yield self.scheduler.update_data(
@@ -2052,7 +2074,7 @@ class Client(Node):
         return self.sync(self._retry, futures, asynchronous=asynchronous)
 
     @gen.coroutine
-    def _publish_dataset(self, *args, **kwargs):
+    def _publish_dataset(self, *args, name=None, **kwargs):
         with log_errors():
             coroutines = []
 
@@ -2064,7 +2086,6 @@ class Client(Node):
                     )
                 )
 
-            name = kwargs.pop("name", None)
             if name:
                 if len(args) == 0:
                     raise ValueError(
@@ -2180,8 +2201,7 @@ class Client(Node):
         return self.sync(self._get_dataset, name, **kwargs)
 
     @gen.coroutine
-    def _run_on_scheduler(self, function, *args, **kwargs):
-        wait = kwargs.pop("wait", True)
+    def _run_on_scheduler(self, function, *args, wait=True, **kwargs):
         response = yield self.scheduler.run_function(
             function=dumps(function), args=dumps(args), kwargs=dumps(kwargs), wait=wait
         )
@@ -2223,10 +2243,7 @@ class Client(Node):
         return self.sync(self._run_on_scheduler, function, *args, **kwargs)
 
     @gen.coroutine
-    def _run(self, function, *args, **kwargs):
-        nanny = kwargs.pop("nanny", False)
-        workers = kwargs.pop("workers", None)
-        wait = kwargs.pop("wait", True)
+    def _run(self, function, *args, nanny=False, workers=None, wait=True, **kwargs):
         responses = yield self.scheduler.broadcast(
             msg=dict(
                 op="run",
@@ -2583,6 +2600,7 @@ class Client(Node):
         priority=0,
         fifo_timeout="60s",
         actors=None,
+        traverse=True,
         **kwargs
     ):
         """ Compute dask collections on cluster
@@ -2646,7 +2664,6 @@ class Client(Node):
             collections = [collections]
             singleton = True
 
-        traverse = kwargs.pop("traverse", True)
         if traverse:
             collections = tuple(
                 dask.delayed(a)
@@ -3013,7 +3030,7 @@ class Client(Node):
             **kwargs
         )
 
-    def ncores(self, workers=None, **kwargs):
+    def nthreads(self, workers=None, **kwargs):
         """ The number of threads/cores available on each worker node
 
         Parameters
@@ -3024,7 +3041,7 @@ class Client(Node):
 
         Examples
         --------
-        >>> c.ncores()  # doctest: +SKIP
+        >>> c.threads()  # doctest: +SKIP
         {'192.168.1.141:46784': 8,
          '192.167.1.142:47548': 8,
          '192.167.1.143:47329': 8,
@@ -3042,6 +3059,8 @@ class Client(Node):
         if workers is not None and not isinstance(workers, (tuple, list, set)):
             workers = [workers]
         return self.sync(self.scheduler.ncores, workers=workers, **kwargs)
+
+    ncores = nthreads
 
     def who_has(self, futures=None, **kwargs):
         """ The workers storing each future's data
@@ -3067,7 +3086,7 @@ class Client(Node):
         See Also
         --------
         Client.has_what
-        Client.ncores
+        Client.nthreads
         """
         if futures is not None:
             futures = self.futures_of(futures)
@@ -3099,7 +3118,7 @@ class Client(Node):
         See Also
         --------
         Client.who_has
-        Client.ncores
+        Client.nthreads
         Client.processing
         """
         if isinstance(workers, tuple) and all(
@@ -3130,7 +3149,7 @@ class Client(Node):
         --------
         Client.who_has
         Client.has_what
-        Client.ncores
+        Client.nthreads
         """
         if isinstance(workers, tuple) and all(
             isinstance(i, (str, tuple)) for i in workers
@@ -3277,9 +3296,10 @@ class Client(Node):
             if plot == "save" and not filename:
                 filename = "dask-profile.html"
 
-            from bokeh.plotting import save
+            if filename:
+                from bokeh.plotting import save
 
-            save(figure, title="Dask Profile", filename=filename)
+                save(figure, title="Dask Profile", filename=filename)
             raise gen.Return((state, figure))
 
         else:

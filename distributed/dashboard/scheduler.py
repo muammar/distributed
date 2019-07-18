@@ -35,6 +35,8 @@ from bokeh.palettes import Viridis11
 from bokeh.themes import Theme
 from bokeh.transform import factor_cmap
 from bokeh.io import curdoc
+import dask
+from dask.utils import format_bytes
 from toolz import pipe, merge
 from tornado import escape
 
@@ -54,7 +56,7 @@ from .core import BokehServer
 from .worker import SystemMonitor, counters_doc
 from .utils import transpose, BOKEH_VERSION, without_property_validation
 from ..metrics import time
-from ..utils import log_errors, format_bytes, format_time
+from ..utils import log_errors, format_time
 from ..diagnostics.progress_stream import color_of, progress_quads, nbytes_bar
 from ..diagnostics.progress import AllProgress
 from ..diagnostics.graph_layout import GraphLayout
@@ -189,7 +191,7 @@ class Occupancy(DashboardComponent):
             if total:
                 self.root.title.text = "Occupancy -- total time: %s  wall time: %s" % (
                     format_time(total),
-                    format_time(total / self.scheduler.total_ncores),
+                    format_time(total / self.scheduler.total_nthreads),
                 )
             else:
                 self.root.title.text = "Occupancy"
@@ -1179,7 +1181,7 @@ class WorkerTable(DashboardComponent):
         self.names = [
             "name",
             "address",
-            "ncores",
+            "nthreads",
             "cpu",
             "memory",
             "memory_limit",
@@ -1198,7 +1200,7 @@ class WorkerTable(DashboardComponent):
         table_names = [
             "name",
             "address",
-            "ncores",
+            "nthreads",
             "cpu",
             "memory",
             "memory_limit",
@@ -1223,7 +1225,7 @@ class WorkerTable(DashboardComponent):
             "read_bytes": NumberFormatter(format="0 b"),
             "write_bytes": NumberFormatter(format="0 b"),
             "num_fds": NumberFormatter(format="0"),
-            "ncores": NumberFormatter(format="0"),
+            "nthreads": NumberFormatter(format="0"),
         }
 
         if BOKEH_VERSION < "0.12.15":
@@ -1345,8 +1347,8 @@ class WorkerTable(DashboardComponent):
                 data["memory_percent"][-1] = ""
             data["memory_limit"][-1] = ws.memory_limit
             data["cpu"][-1] = ws.metrics["cpu"] / 100.0
-            data["cpu_fraction"][-1] = ws.metrics["cpu"] / 100.0 / ws.ncores
-            data["ncores"][-1] = ws.ncores
+            data["cpu_fraction"][-1] = ws.metrics["cpu"] / 100.0 / ws.nthreads
+            data["nthreads"][-1] = ws.nthreads
 
         self.source.data.update(data)
 
@@ -1417,7 +1419,9 @@ def tasks_doc(scheduler, extra, doc):
     with log_errors():
         ts = TaskStream(
             scheduler,
-            n_rectangles=100000,
+            n_rectangles=dask.config.get(
+                "distributed.scheduler.dashboard.tasks.task-stream-length"
+            ),
             clear_interval="60s",
             sizing_mode="stretch_both",
         )
@@ -1447,7 +1451,9 @@ def status_doc(scheduler, extra, doc):
     with log_errors():
         task_stream = TaskStream(
             scheduler,
-            n_rectangles=1000,
+            n_rectangles=dask.config.get(
+                "distributed.scheduler.dashboard.status.task-stream-length"
+            ),
             clear_interval="10s",
             sizing_mode="stretch_both",
         )
@@ -1590,6 +1596,25 @@ class BokehScheduler(BokehServer):
         self.prefix = prefix
 
         self.server_kwargs = kwargs
+
+        # TLS configuration
+        http_server_kwargs = kwargs.setdefault("http_server_kwargs", {})
+        tls_key = dask.config.get("distributed.scheduler.dashboard.tls.key")
+        tls_cert = dask.config.get("distributed.scheduler.dashboard.tls.cert")
+        tls_ca_file = dask.config.get("distributed.scheduler.dashboard.tls.ca-file")
+        if tls_cert and "ssl_options" not in http_server_kwargs:
+            import ssl
+
+            ctx = ssl.create_default_context(
+                cafile=tls_ca_file, purpose=ssl.Purpose.SERVER_AUTH
+            )
+            ctx.load_cert_chain(tls_cert, keyfile=tls_key)
+            # Unlike the client/scheduler/worker TLS handling, we don't care
+            # about authenticating the user's webclient, TLS here is just for
+            # encryption. Disable these checks.
+            ctx.check_hostname = False
+            ctx.verify_mode = ssl.CERT_NONE
+            http_server_kwargs["ssl_options"] = ctx
 
         self.server_kwargs["prefix"] = prefix or None
 

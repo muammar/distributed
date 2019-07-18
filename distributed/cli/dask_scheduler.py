@@ -78,6 +78,13 @@ pem_file_option_type = click.Path(exists=True, resolve_path=True)
     required=False,
     help="Launch the Dashboard",
 )
+@click.option(
+    "--bokeh/--no-bokeh",
+    "bokeh",
+    default=None,
+    required=False,
+    help="Deprecated.  See --dashboard/--no-dashboard.",
+)
 @click.option("--show/--no-show", default=False, help="Show web UI")
 @click.option(
     "--dashboard-prefix", type=str, default=None, help="Prefix for the dashboard app"
@@ -113,12 +120,14 @@ pem_file_option_type = click.Path(exists=True, resolve_path=True)
 @click.argument(
     "preload_argv", nargs=-1, type=click.UNPROCESSED, callback=validate_preload_argv
 )
+@click.version_option()
 def main(
     host,
     port,
     bokeh_port,
     show,
     dashboard,
+    bokeh,
     dashboard_prefix,
     use_xheaders,
     pid_file,
@@ -145,6 +154,11 @@ def main(
             "Consider adding ``--dashboard-address :%d`` " % bokeh_port
         )
         dashboard_address = bokeh_port
+    if bokeh is not None:
+        warnings.warn(
+            "The --bokeh/--no-bokeh flag has been renamed to --dashboard/--no-dashboard. "
+        )
+        dashboard = bokeh
 
     if port is None and (not host or not re.search(r":\d", host)):
         port = 8786
